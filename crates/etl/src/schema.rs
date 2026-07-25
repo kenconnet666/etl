@@ -613,6 +613,17 @@ impl ReplicatedTableSchema {
                         });
                     }
 
+                    if old_column.typ != new_column.typ
+                        || old_column.modifier != new_column.modifier
+                    {
+                        modifications.push(ColumnModification::Type {
+                            old_type: old_column.typ.clone(),
+                            old_modifier: old_column.modifier,
+                            new_type: new_column.typ.clone(),
+                            new_modifier: new_column.modifier,
+                        });
+                    }
+
                     if old_column.nullable != new_column.nullable {
                         modifications.push(ColumnModification::Nullability {
                             old_nullable: old_column.nullable,
@@ -773,6 +784,17 @@ pub enum ColumnModification {
         old_expression: Option<String>,
         /// The new default expression, if one exists.
         new_expression: Option<String>,
+    },
+    /// The column data type or type modifier changed.
+    Type {
+        /// The previous Postgres type.
+        old_type: Type,
+        /// The previous type modifier.
+        old_modifier: i32,
+        /// The new Postgres type.
+        new_type: Type,
+        /// The new type modifier.
+        new_modifier: i32,
     },
     /// The column nullability changed.
     Nullability {

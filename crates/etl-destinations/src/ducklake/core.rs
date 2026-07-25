@@ -73,10 +73,11 @@ use crate::ducklake::{
         ensure_replay_epoch_table_exists, read_table_replay_epoch,
     },
     schema::{
-        build_add_column_sql_ducklake, build_create_table_sql_ducklake,
+        build_add_column_sql_ducklake, build_alter_column_nullability_sql_ducklake,
+        build_alter_column_type_sql_ducklake, build_create_table_sql_ducklake,
         build_drop_column_sql_ducklake, build_drop_default_sql_ducklake,
         build_rename_column_sql_ducklake, build_set_default_sql_ducklake,
-        supports_column_default_ducklake,
+        postgres_column_type_to_ducklake_sql, supports_column_default_ducklake,
     },
     sql::qualified_lake_table_name,
 };
@@ -709,14 +710,44 @@ fn plan_schema_diff_sql_ducklake(
         for modification in &change.modifications {
             match modification {
                 ColumnModification::Rename { .. } => {}
-                ColumnModification::Nullability { old_nullable, new_nullable } => {
-                    warn!(
-                        table_name = %table_name,
-                        column_name = %change.new_column.name,
-                        old_nullable,
-                        new_nullable,
-                        "skipping source column nullability change for DuckLake"
-                    );
+                ColumnModification::Type { old_type, old_modifier, new_type, new_modifier } => {
+                    let old_ducklake_type =
+                        postgres_column_type_to_ducklake_sql(old_type, *old_modifier);
+                    let new_ducklake_type =
+                        postgres_column_type_to_ducklake_sql(new_type, *new_modifier);
+
+                    // Distinct source types can share one destination type,
+                    // for example when both fall back to `varchar`.
+                    if old_ducklake_type == new_ducklake_type {
+                        debug!(
+                            table = %table_name,
+                            column = %change.new_column.name,
+                            ducklake_type = %new_ducklake_type,
+                            "ducklake column type change skipped because the destination type is \
+                             unchanged"
+                        );
+                        continue;
+                    }
+
+                    statements.push(DuckLakeSchemaDdlStatement {
+                        sql: build_alter_column_type_sql_ducklake(
+                            table_name,
+                            &change.new_column.name,
+                            new_type,
+                            *new_modifier,
+                        ),
+                        error_description: "DuckLake alter table alter column type failed",
+                    });
+                }
+                ColumnModification::Nullability { new_nullable, .. } => {
+                    statements.push(DuckLakeSchemaDdlStatement {
+                        sql: build_alter_column_nullability_sql_ducklake(
+                            table_name,
+                            &change.new_column.name,
+                            *new_nullable,
+                        ),
+                        error_description: "DuckLake alter table alter column nullability failed",
+                    });
                 }
                 ColumnModification::Default { old_expression, new_expression } => {
                     let old_default_was_supported =

@@ -1612,3 +1612,140 @@ async fn schema_change_matches_simulator_generated_column_types() {
         }
     );
 }
+
+/// Expected row shape after a source column type widening.
+#[derive(Debug, Eq, PartialEq)]
+struct SchemaTypeRow {
+    id: i64,
+    qty: i64,
+    note: String,
+}
+
+/// Queries rows after a column type change using blocking DuckDB APIs.
+fn query_schema_type_rows(conn: &Connection, table_name: &DuckLakeTableName) -> Vec<SchemaTypeRow> {
+    let sql =
+        format!("select id, qty, note from {} order by id", qualified_lake_table_name(table_name));
+    let mut statement = conn.prepare(&sql).expect("failed to prepare schema type query");
+    let mut rows = statement.query([]).expect("failed to run schema type query");
+    let mut result = Vec::new();
+
+    while let Some(row) = rows.next().expect("failed to read schema type row") {
+        result.push(SchemaTypeRow {
+            id: row.get(0).expect("failed to read id"),
+            qty: row.get(1).expect("failed to read qty"),
+            note: row.get(2).expect("failed to read note"),
+        });
+    }
+
+    result
+}
+
+/// Reads the DuckLake column type and nullability for one column.
+fn query_ducklake_column_type(
+    conn: &Connection,
+    table_name: &DuckLakeTableName,
+    column_name: &str,
+) -> (String, String) {
+    let sql = format!(
+        "select data_type, is_nullable from {}.information_schema.columns where table_schema = {} \
+         and table_name = {} and column_name = {}",
+        quote_identifier("lake"),
+        quote_literal(table_name.schema()),
+        quote_literal(table_name.table()),
+        quote_literal(column_name)
+    );
+    let mut statement = conn.prepare(&sql).expect("failed to prepare column type query");
+    let mut rows = statement.query([]).expect("failed to run column type query");
+    let row = rows
+        .next()
+        .expect("failed to read column type row")
+        .expect("column should exist in DuckLake");
+
+    (row.get(0).expect("failed to read data_type"), row.get(1).expect("failed to read is_nullable"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_change_column_type_and_nullability() {
+    init_test_tracing();
+
+    let database = spawn_source_database().await;
+    let table_name = test_table_name("ducklake_schema_col_type");
+    let table_id = database
+        .create_table(table_name.clone(), true, &[("qty", "integer not null"), ("note", "text")])
+        .await
+        .expect("failed to create source table");
+    let publication_name = "test_pub_ducklake_schema_type";
+    database
+        .create_publication(publication_name, std::slice::from_ref(&table_name))
+        .await
+        .expect("failed to create publication");
+    database
+        .run_sql(&format!(
+            "insert into {} (qty, note) values (7, 'first')",
+            table_name.as_quoted_identifier()
+        ))
+        .await
+        .expect("failed to insert the first row");
+
+    let lake = create_test_lake("schema_change_column_type").await;
+    let catalog_url = lake.catalog_url.clone();
+    let data_url = lake.data_url.clone();
+    let ducklake_table_name = table_name_to_ducklake_table_name(&table_name)
+        .expect("failed to build DuckLake table name");
+    let store = NotifyingStore::new();
+    let pipeline_id: PipelineId = random();
+    let destination = build_destination(&catalog_url, &data_url, store.clone()).await;
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        publication_name.to_owned(),
+        store.clone(),
+        destination.clone(),
+    );
+    let table_ready = store.notify_on_table_state_type(table_id, TableStateType::Ready).await;
+
+    pipeline.start().await.unwrap();
+    table_ready.notified().await;
+
+    let event_notify = destination
+        .wait_for_events_count(vec![(EventType::Relation, 1), (EventType::Insert, 1)])
+        .await;
+
+    // Widen `qty` past the 32-bit range and tighten `note` to not null. Both
+    // changes must reach DuckLake so the replica keeps matching the source.
+    database
+        .alter_table(
+            table_name.clone(),
+            &[
+                TableModification::AlterColumn { name: "qty", alteration: "type bigint" },
+                TableModification::AlterColumn { name: "note", alteration: "set not null" },
+            ],
+        )
+        .await
+        .expect("failed to alter source table");
+    database
+        .run_sql(&format!(
+            "insert into {} (qty, note) values (5000000000, 'second')",
+            table_name.as_quoted_identifier()
+        ))
+        .await
+        .expect("failed to insert the second row");
+
+    event_notify.notified().await;
+    pipeline.shutdown_and_wait().await.unwrap();
+    drop(destination);
+    checkpoint_lake(&catalog_url, &data_url);
+
+    let conn = open_lake_conn(&catalog_url, &data_url);
+    let (qty_type, _) = query_ducklake_column_type(&conn, &ducklake_table_name, "qty");
+    assert_eq!(qty_type, "BIGINT");
+    let (_, note_nullable) = query_ducklake_column_type(&conn, &ducklake_table_name, "note");
+    assert_eq!(note_nullable, "NO");
+    assert_eq!(
+        query_schema_type_rows(&conn, &ducklake_table_name),
+        vec![
+            SchemaTypeRow { id: 1, qty: 7, note: "first".to_owned() },
+            SchemaTypeRow { id: 2, qty: 5_000_000_000, note: "second".to_owned() },
+        ]
+    );
+}

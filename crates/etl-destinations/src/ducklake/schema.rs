@@ -60,7 +60,7 @@ fn postgres_array_type_to_ducklake_sql(typ: &Type, _modifier: i32) -> &'static s
 }
 
 /// Returns the DuckLake SQL type string for a Postgres column type.
-fn postgres_column_type_to_ducklake_sql(typ: &Type, modifier: i32) -> Cow<'static, str> {
+pub(super) fn postgres_column_type_to_ducklake_sql(typ: &Type, modifier: i32) -> Cow<'static, str> {
     if is_array_type(typ) {
         postgres_array_type_to_ducklake_sql(typ, modifier).into()
     } else {
@@ -266,6 +266,38 @@ pub(super) fn build_rename_column_sql_ducklake(
     let new_name = quote_identifier(new_name);
 
     format!("alter table {table_name} rename column {old_name} to {new_name}")
+}
+
+/// Builds a DuckLake `alter table alter column set data type` statement.
+///
+/// DuckDB applies its own implicit cast while rewriting the column, so a
+/// widening source change such as `integer` to `bigint` succeeds directly. A
+/// change the destination cannot cast fails loudly instead of silently writing
+/// mismatched values.
+pub(super) fn build_alter_column_type_sql_ducklake(
+    table_name: &DuckLakeTableName,
+    column_name: &str,
+    typ: &Type,
+    modifier: i32,
+) -> String {
+    let ducklake_type = postgres_column_type_to_ducklake_sql(typ, modifier);
+    let table_name = qualified_lake_table_name(table_name);
+    let column_name = quote_identifier(column_name);
+
+    format!("alter table {table_name} alter column {column_name} set data type {ducklake_type}")
+}
+
+/// Builds a DuckLake `alter table alter column set/drop not null` statement.
+pub(super) fn build_alter_column_nullability_sql_ducklake(
+    table_name: &DuckLakeTableName,
+    column_name: &str,
+    nullable: bool,
+) -> String {
+    let table_name = qualified_lake_table_name(table_name);
+    let column_name = quote_identifier(column_name);
+    let action = if nullable { "drop not null" } else { "set not null" };
+
+    format!("alter table {table_name} alter column {column_name} {action}")
 }
 
 /// Builds a DuckLake `alter table alter column set default` statement.
