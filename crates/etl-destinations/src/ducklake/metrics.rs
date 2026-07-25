@@ -651,10 +651,8 @@ pub(super) fn resolve_ducklake_metadata_schema_blocking(
     // `information_schema` view only covers the current (memory) catalog and
     // would return no rows for the metadata tables.
     let metadata_catalog = format!("__ducklake_metadata_{LAKE_CATALOG}");
-    let qualified_table = format!(
-        "{}.information_schema.tables",
-        quote_identifier(&metadata_catalog)
-    );
+    let qualified_table =
+        format!("{}.information_schema.tables", quote_identifier(&metadata_catalog));
     let sql = format!(
         r#"SELECT table_schema
            FROM {qualified_table}
