@@ -202,7 +202,6 @@ pub(super) struct ExternalMaintenanceOperationSample {
 pub enum DuckLakeMaintenanceMode {
     #[default]
     Disabled,
-    Kubernetes,
     Postgres,
 }
 
@@ -216,10 +215,6 @@ pub struct DuckLakeExternalMaintenanceConfig {
 impl DuckLakeExternalMaintenanceConfig {
     pub const fn disabled() -> Self {
         Self { mode: DuckLakeMaintenanceMode::Disabled, pipeline_id: 0 }
-    }
-
-    pub const fn kubernetes(pipeline_id: u64) -> Self {
-        Self { mode: DuckLakeMaintenanceMode::Kubernetes, pipeline_id }
     }
 
     pub const fn postgres(pipeline_id: u64) -> Self {
@@ -1268,24 +1263,6 @@ where
         match external_maintenance.mode {
             DuckLakeMaintenanceMode::Disabled => {
                 info!("ducklake external maintenance watcher disabled by configuration");
-            }
-            DuckLakeMaintenanceMode::Kubernetes => {
-                use crate::ducklake::external_maintenance::run_kubernetes_external_maintenance_watcher;
-
-                let watcher_destination = destination.clone();
-                destination
-                    .tasks
-                    .spawn(async move {
-                        if let Err(error) =
-                            run_kubernetes_external_maintenance_watcher(watcher_destination).await
-                        {
-                            warn!(
-                                error = %error,
-                                "ducklake external maintenance watcher exited"
-                            );
-                        }
-                    })
-                    .await;
             }
             DuckLakeMaintenanceMode::Postgres => {
                 use crate::ducklake::external_maintenance::run_postgres_external_maintenance_watcher;

@@ -18,7 +18,7 @@ pub(crate) const READ_REPLICA_PORT_OFFSET: u16 = 1000;
 pub(crate) const NIGHTLY_TOOLCHAIN: &str = "nightly-2026-04-15";
 
 /// Packages covered by destination-focused xtask presets.
-const DESTINATION_PACKAGES: &[&str] = &["etl-destinations", "etl-api", "etl-replicator"];
+const DESTINATION_PACKAGES: &[&str] = &["etl-destinations", "etl-replicator"];
 /// ANSI yellow foreground color.
 const YELLOW: &str = "\x1b[33m";
 /// ANSI cyan foreground color.
@@ -114,32 +114,16 @@ impl CargoFeatureSelection {
 /// Destination-specific xtask preset.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum DestinationPreset {
-    /// BigQuery destination.
-    #[value(name = "bigquery")]
-    BigQuery,
-    /// ClickHouse destination.
-    #[value(name = "clickhouse")]
-    ClickHouse,
     /// DuckLake destination.
     #[value(name = "ducklake")]
     DuckLake,
-    /// Iceberg destination.
-    #[value(name = "iceberg")]
-    Iceberg,
-    /// Snowflake destination.
-    #[value(name = "snowflake")]
-    Snowflake,
 }
 
 impl DestinationPreset {
     /// Returns the Cargo feature for this destination.
     fn feature(self) -> &'static str {
         match self {
-            DestinationPreset::BigQuery => "bigquery",
-            DestinationPreset::ClickHouse => "clickhouse",
             DestinationPreset::DuckLake => "ducklake",
-            DestinationPreset::Iceberg => "iceberg",
-            DestinationPreset::Snowflake => "snowflake",
         }
     }
 }
@@ -163,13 +147,6 @@ pub(crate) fn maybe_with_sccache(cmd: Cmd<'_>, flag: bool) -> Cmd<'_> {
     };
 
     env.apply_to_xshell(cmd)
-}
-
-/// Conditionally injects the sccache environment into a process command.
-pub(crate) fn maybe_configure_sccache(cmd: &mut Command, flag: bool) {
-    if let Some(env) = sccache_env(flag) {
-        env.apply_to_process(cmd);
-    }
 }
 
 /// Pushes a value unless it is already present.
@@ -200,15 +177,6 @@ impl SccacheEnv {
             .env("CXX", format!("sccache {}", self.cxx))
             .env("CARGO_INCREMENTAL", "0")
             .env("SCCACHE_CACHE_SIZE", "20G")
-    }
-
-    /// Applies this sccache configuration to a process command.
-    fn apply_to_process(&self, cmd: &mut Command) {
-        cmd.env("RUSTC_WRAPPER", "sccache");
-        cmd.env("CC", format!("sccache {}", self.cc));
-        cmd.env("CXX", format!("sccache {}", self.cxx));
-        cmd.env("CARGO_INCREMENTAL", "0");
-        cmd.env("SCCACHE_CACHE_SIZE", "20G");
     }
 }
 

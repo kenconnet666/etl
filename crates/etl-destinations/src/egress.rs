@@ -23,7 +23,7 @@ pub const PROCESSING_TYPE_STREAMING: &str = "streaming";
 /// # Fields logged
 /// - `message`: `"etl_processed_bytes"`
 /// - `egress_metric`: `true`
-/// - `destination_type`: the destination name (e.g., `"bigquery"`, `"iceberg"`)
+/// - `destination_type`: the destination name (e.g., `"ducklake"`)
 /// - `processing_type`: `"table_copy"` or `"streaming"`
 /// - `bytes_sent`: number of bytes sent to the destination
 /// - `bytes_received`: number of bytes received from the destination (0 if not

@@ -6,8 +6,6 @@ mod materialization;
 #[cfg(feature = "ducklake")]
 pub mod ducklake;
 
-#[cfg(feature = "ducklake")]
-pub use coordination::KubernetesExternalMaintenanceStore;
 pub use coordination::{
     ExternalMaintenanceOperationHistory, ExternalMaintenanceOperationPolicy,
     ExternalMaintenanceOperationRequest, ExternalMaintenanceOperationRun,

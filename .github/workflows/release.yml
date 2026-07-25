@@ -112,7 +112,7 @@ jobs:
     needs: [version, create-tag]
     strategy:
       matrix:
-        image: [etl-api, etl-replicator]
+        image: [etl-replicator]
     uses: ./.github/workflows/docker-build.yml
     with:
       image: public.ecr.aws/supabase/${{ matrix.image }}
@@ -143,13 +143,10 @@ jobs:
             echo "Release ${TAG}"
             echo
             echo "Docker images published:"
-            echo "- public.ecr.aws/supabase/etl-api:latest"
-            echo "- public.ecr.aws/supabase/etl-api:${TAG}"
             echo "- public.ecr.aws/supabase/etl-replicator:latest"
             echo "- public.ecr.aws/supabase/etl-replicator:${TAG}"
             echo
             echo "View on ECR Public Gallery:"
-            echo "- https://gallery.ecr.aws/supabase/etl-api"
             echo "- https://gallery.ecr.aws/supabase/etl-replicator"
             echo "MARKER"
           } >> "$GITHUB_OUTPUT"

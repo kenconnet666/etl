@@ -15,7 +15,6 @@ doctest = false
 test-utils = []
 tokio = []
 sqlx = []
-bigquery = []
 store = ["sqlx"]
 
 [dependencies]

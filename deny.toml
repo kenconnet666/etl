@@ -1,7 +1,26 @@
 [advisories]
 version = 2
-ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "Disabling because it is not a real vulnerability. The crate paste is just unmaintained." },
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS via crafted XML, fixed only in 0.41.0 which is behind the reqsign and opendal pins used by iceberg. Exposure requires attacker-controlled object store or catalog XML responses. Remove once iceberg's dependency tree reaches quick-xml >= 0.41.0." },
-    { id = "RUSTSEC-2026-0195", reason = "Same quick-xml dependency chain and exposure as RUSTSEC-2026-0194, fixed only in 0.41.0. Remove once iceberg's dependency tree reaches quick-xml >= 0.41.0." },
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
 ]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"

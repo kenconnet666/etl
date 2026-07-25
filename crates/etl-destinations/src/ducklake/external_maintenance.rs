@@ -8,8 +8,7 @@ pub use etl_maintenance::{
     ExternalMaintenanceOperations, ExternalMaintenancePause, ExternalMaintenancePausePolicy,
     ExternalMaintenanceReplicatorState, ExternalMaintenanceReplicatorStatus,
     ExternalMaintenanceRequestOutcome, ExternalMaintenanceRun, ExternalMaintenanceState,
-    ExternalMaintenanceStore, ExternalMaintenanceWatcherConfig, KubernetesExternalMaintenanceStore,
-    PostgresExternalMaintenanceStore,
+    ExternalMaintenanceStore, ExternalMaintenanceWatcherConfig, PostgresExternalMaintenanceStore,
 };
 use metrics::{counter, gauge, histogram};
 use sqlx::PgPool;
@@ -60,22 +59,6 @@ struct HeldPause {
 struct ExpireSnapshotsRequestGate {
     initialized_from_state: bool,
     next_request_after: Option<DateTime<Utc>>,
-}
-
-pub(super) async fn run_kubernetes_external_maintenance_watcher<S>(
-    destination: DuckLakeDestination<S>,
-) -> EtlResult<()>
-where
-    S: DestinationStore,
-{
-    let config = ExternalMaintenanceWatcherConfig::from_env();
-    let Some(store) = KubernetesExternalMaintenanceStore::from_env(config.store_timeout).await?
-    else {
-        info!("ducklake Kubernetes external maintenance watcher disabled because CR env is absent");
-        return Ok(());
-    };
-
-    run_external_maintenance_watcher(destination, store, config).await
 }
 
 pub(super) async fn run_postgres_external_maintenance_watcher<S>(

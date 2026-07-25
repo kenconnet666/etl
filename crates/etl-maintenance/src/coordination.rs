@@ -357,12 +357,6 @@ mod postgres;
 
 pub use postgres::PostgresExternalMaintenanceStore;
 
-#[cfg(feature = "ducklake")]
-mod kubernetes;
-
-#[cfg(feature = "ducklake")]
-pub use kubernetes::KubernetesExternalMaintenanceStore;
-
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok())
 }

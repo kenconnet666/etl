@@ -9,8 +9,6 @@ use clap::Args;
 
 use crate::utils::workspace_root;
 
-/// Migration directory for etl-api public schema migrations.
-const ETL_API_MIGRATIONS_DIR: &str = "crates/etl-api/migrations";
 /// Migration directory for source database migrations.
 const ETL_SOURCE_MIGRATIONS_DIR: &str = "crates/etl/migrations/source";
 /// Migration directory for Postgres store migrations.
@@ -28,7 +26,6 @@ Usage: cargo x migrate [OPTIONS] [TARGETS...]
 Run database migrations for etl components.
 
 Targets:
-  etl-api    Run etl-api migrations (public schema)
   etl        Run etl source and Postgres store migrations (etl schema)
   all        Run all migrations (default if no target specified)
 
@@ -37,16 +34,14 @@ Options:
 
 Examples:
   cargo x migrate              # Run all migrations
-  cargo x migrate etl-api      # Run only etl-api migrations
   cargo x migrate etl          # Run only etl migrations
-  cargo x migrate etl-api etl  # Run both explicitly
 ";
 
 /// Arguments for running database migrations.
 #[derive(Args)]
 #[command(disable_help_flag = true)]
 pub(crate) struct MigrateArgs {
-    /// Migration targets (etl-api, etl, all).
+    /// Migration targets (etl, all).
     #[arg(value_name = "TARGETS", trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -85,10 +80,6 @@ pub(super) fn run_migrations_with_env<'a>(
         require_command("psql", &["--version"], "Postgres client (psql) is not installed")?;
     }
 
-    if selection.run_etl_api {
-        run_etl_api_migrations(&workspace_root, &database)?;
-    }
-
     if selection.run_etl {
         run_etl_migrations(&workspace_root, &database)?;
     }
@@ -99,8 +90,6 @@ pub(super) fn run_migrations_with_env<'a>(
 
 /// Selected migration targets.
 struct MigrationSelection {
-    /// Whether to run etl-api migrations.
-    run_etl_api: bool,
     /// Whether to run etl migrations.
     run_etl: bool,
 }
@@ -109,19 +98,14 @@ impl MigrationSelection {
     /// Parses target arguments into a migration selection.
     fn parse(args: &[String]) -> Result<MigrationAction> {
         if args.is_empty() {
-            return Ok(MigrationAction::Run(Self { run_etl_api: true, run_etl: true }));
+            return Ok(MigrationAction::Run(Self { run_etl: true }));
         }
 
-        let mut selection = Self { run_etl_api: false, run_etl: false };
+        let mut selection = Self { run_etl: false };
         for arg in args {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(MigrationAction::Help),
-                "etl-api" => selection.run_etl_api = true,
-                "etl" => selection.run_etl = true,
-                "all" => {
-                    selection.run_etl_api = true;
-                    selection.run_etl = true;
-                }
+                "etl" | "all" => selection.run_etl = true,
                 _ => {
                     eprintln!("Error: Unknown argument '{arg}'");
                     print_usage_to_stderr();
@@ -238,28 +222,6 @@ impl DatabaseEnv {
             cmd.env("PGSSLROOTCERT", pg_ssl_root_cert);
         }
     }
-}
-
-/// Runs etl-api migrations.
-fn run_etl_api_migrations(workspace_root: &Path, database: &DatabaseEnv) -> Result<()> {
-    let migrations_dir = workspace_root.join(ETL_API_MIGRATIONS_DIR);
-    ensure_migrations_dir(&migrations_dir, ETL_API_MIGRATIONS_DIR)?;
-
-    println!("Running etl-api migrations...");
-
-    let mut create = Command::new("sqlx");
-    create.args(["database", "create"]);
-    database.apply_to(&mut create);
-    run_command(create, "Failed to create etl-api database")?;
-
-    let mut migrate = Command::new("sqlx");
-    migrate.args(["migrate", "run", "--source"]);
-    migrate.arg(&migrations_dir);
-    database.apply_to(&mut migrate);
-    run_command(migrate, "Failed to run etl-api migrations")?;
-
-    println!("etl-api migrations complete!");
-    Ok(())
 }
 
 /// Runs etl source and Postgres store migrations.

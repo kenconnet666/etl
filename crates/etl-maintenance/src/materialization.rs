@@ -86,7 +86,6 @@ pub struct DuckLakeMaintenanceMaterialization {
 /// Configured external maintenance backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceMaterializerKind {
-    Kubernetes,
     Postgres,
     Disabled,
 }
@@ -112,14 +111,6 @@ impl MaintenanceMaterializationError {
         E: Error + Send + Sync + 'static,
     {
         Self::Backend { backend, source: Box::new(source) }
-    }
-
-    /// Wraps a Kubernetes materialization error.
-    pub fn kubernetes<E>(source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self::backend(MaintenanceMaterializerKind::Kubernetes, source)
     }
 
     /// Wraps a Postgres materialization error.

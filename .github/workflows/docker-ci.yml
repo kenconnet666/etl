@@ -99,7 +99,7 @@ jobs:
       )
     strategy:
       matrix:
-        image: [etl-api, etl-replicator]
+        image: [etl-replicator]
     uses: ./.github/workflows/docker-build.yml
     secrets:
       PROD_AWS_ROLE: ${{ secrets.PROD_AWS_ROLE }}

@@ -157,22 +157,6 @@ jobs:
             postgres_version: 17
             postgres_image: postgres:17
             coverage: false
-          - postgres_label: postgres-16
-            postgres_version: 16
-            postgres_image: postgres:16
-            coverage: false
-          - postgres_label: postgres-15
-            postgres_version: 15
-            postgres_image: postgres:15
-            coverage: false
-          - postgres_label: postgres-14
-            postgres_version: 14
-            postgres_image: postgres:14
-            coverage: false
-          - postgres_label: orioledb-beta14-pg17
-            postgres_version: 17
-            postgres_image: orioledb/orioledb:beta14-pg17
-            coverage: false
     env:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -190,9 +174,6 @@ jobs:
       TESTS_DATABASE_PASSWORD: postgres
       TESTS_DATABASE_TLS_ENABLED: "true"
       TESTS_DATABASE_TLS_ROOT_CERT: ${{ github.workspace }}/target/postgres-tls/root.crt
-      TESTS_CLICKHOUSE_URL: http://localhost:8123
-      TESTS_CLICKHOUSE_USER: etl
-      TESTS_CLICKHOUSE_PASSWORD: etl
       ETL_DUCKDB_EXTENSION_ROOT: ${{ github.workspace }}/vendor/duckdb/extensions
     steps:
       - name: Checkout
@@ -221,34 +202,6 @@ jobs:
             *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
           esac
           ./scripts/bin/vendor-duckdb-extensions.sh --platform "${duckdb_platform}"
-
-      - name: Install sqlx-cli
-        run: |
-          cargo install sqlx-cli \
-            --version 0.9.0-alpha.1 \
-            --features native-tls,postgres \
-            --no-default-features \
-            --locked
-
-      - name: Migrate Database
-        run: |
-          sudo apt-get install libpq-dev -y
-          cargo x migrate etl-api
-
-      - name: Set up BigQuery Credentials
-        # Conditional: fork PRs never receive secrets, BigQuery tests skipped gracefully.
-        env:
-          TESTS_BIGQUERY_PROJECT_ID: ${{ secrets.TESTS_BIGQUERY_PROJECT_ID }}
-          TESTS_BIGQUERY_SA_KEY_JSON: ${{ secrets.TESTS_BIGQUERY_SA_KEY_JSON }}
-        run: |
-          if [ -n "${TESTS_BIGQUERY_SA_KEY_JSON}" ]; then
-            printf '%s' "${TESTS_BIGQUERY_SA_KEY_JSON}" > /tmp/bigquery-sa-key.json
-            {
-              echo "TESTS_BIGQUERY_SA_KEY_PATH=/tmp/bigquery-sa-key.json"
-              echo "TESTS_BIGQUERY_PROJECT_ID=${TESTS_BIGQUERY_PROJECT_ID}"
-              echo "REQUIRE_BIGQUERY_CREDENTIALS=true"
-            } >> "$GITHUB_ENV"
-          fi
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10

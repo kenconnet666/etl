@@ -2,11 +2,11 @@ use anyhow::{Result, bail};
 use clap::Args;
 use xshell::{Shell, cmd};
 
-const KNOWN_EXAMPLES: &[&str] = &["bigquery", "clickhouse", "ducklake", "snowflake"];
+const KNOWN_EXAMPLES: &[&str] = &["ducklake"];
 
 #[derive(Args)]
 pub(crate) struct ExampleArgs {
-    /// Example name (bigquery, clickhouse, ducklake, snowflake).
+    /// Example name (ducklake).
     name: String,
 
     /// Extra arguments passed through to the example binary.
@@ -22,10 +22,10 @@ impl ExampleArgs {
             bail!("unknown example '{name}'. Available: {}", KNOWN_EXAMPLES.join(", "));
         }
 
-        let db_host = env_or("TESTS_DATABASE_HOST", None);
-        let db_port = env_or("TESTS_DATABASE_PORT", None);
-        let db_username = env_or("TESTS_DATABASE_USERNAME", None);
-        let db_password = env_or("TESTS_DATABASE_PASSWORD", None);
+        let db_host = env_or("TESTS_DATABASE_HOST");
+        let db_port = env_or("TESTS_DATABASE_PORT");
+        let db_username = env_or("TESTS_DATABASE_USERNAME");
+        let db_password = env_or("TESTS_DATABASE_PASSWORD");
 
         let missing: Vec<&str> = [
             db_host.is_none().then_some("TESTS_DATABASE_HOST"),
@@ -53,30 +53,6 @@ impl ExampleArgs {
         inject(&mut extra, "--db-name", &Some("etl_testdata".to_owned()), &self.args);
         inject(&mut extra, "--publication", &Some("seed_pub".to_owned()), &self.args);
 
-        match name.as_str() {
-            "bigquery" => {
-                inject_env(&mut extra, "--bq-project-id", "TESTS_BIGQUERY_PROJECT_ID", &self.args);
-                inject_env(
-                    &mut extra,
-                    "--bq-sa-key-file",
-                    "TESTS_BIGQUERY_SA_KEY_PATH",
-                    &self.args,
-                );
-            }
-            "clickhouse" => {
-                inject_env(&mut extra, "--clickhouse-url", "TESTS_CLICKHOUSE_URL", &self.args);
-                inject_env(&mut extra, "--clickhouse-user", "TESTS_CLICKHOUSE_USER", &self.args);
-                inject_env(
-                    &mut extra,
-                    "--clickhouse-password",
-                    "TESTS_CLICKHOUSE_PASSWORD",
-                    &self.args,
-                );
-            }
-            "snowflake" => {}
-            _ => {}
-        }
-
         extra.extend(self.args.iter().cloned());
 
         let sh = Shell::new()?;
@@ -88,16 +64,12 @@ impl ExampleArgs {
     }
 }
 
-fn env_or(key: &str, default: Option<&str>) -> Option<String> {
-    std::env::var(key).ok().or_else(|| default.map(String::from))
+fn env_or(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag || a.starts_with(&format!("{flag}=")))
-}
-
-fn inject_env(extra: &mut Vec<String>, flag: &str, env_var: &str, user_args: &[String]) {
-    inject(extra, flag, &env_or(env_var, None), user_args);
 }
 
 fn inject(extra: &mut Vec<String>, flag: &str, value: &Option<String>, user_args: &[String]) {

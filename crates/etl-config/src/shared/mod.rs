@@ -13,8 +13,7 @@ pub use connection::{
     PgConnectionOptionsBuilder, TcpKeepaliveConfig, TlsConfig,
 };
 pub use destination::{
-    ClickHouseEngine, DestinationConfig, DestinationConfigWithoutSecrets, DestinationKind,
-    DuckLakeMaintenanceMode, IcebergConfig, IcebergConfigWithoutSecrets,
+    DestinationConfig, DestinationConfigWithoutSecrets, DestinationKind, DuckLakeMaintenanceMode,
 };
 pub use pipeline::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PipelineConfig,
@@ -23,4 +22,4 @@ pub use pipeline::{
 pub use replicator::{ReplicatorConfig, ReplicatorConfigWithoutSecrets};
 pub use sentry::SentryConfig;
 pub use supabase::{SupabaseConfig, SupabaseConfigWithoutSecrets};
-pub use validators::{validate_snowflake_account_id, validate_supabase_project_ref};
+pub use validators::validate_supabase_project_ref;
