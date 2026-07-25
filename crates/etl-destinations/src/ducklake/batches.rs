@@ -519,6 +519,74 @@ fn ensure_helper_table_replay_epoch_column(
     Ok(())
 }
 
+/// Re-keys ETL helper rows after a destination table rename.
+///
+/// Applied-batch markers and streaming progress are keyed by the destination
+/// table id, so a rename must carry them over or replay would restart from the
+/// beginning under the new name. Helper tables are created lazily, so a missing
+/// one is not an error.
+pub(super) fn rename_helper_table_rows_blocking(
+    conn: &duckdb::Connection,
+    old_table_id: &str,
+    new_table_id: &str,
+) -> EtlResult<()> {
+    for helper_table in [APPLIED_BATCHES_TABLE, STREAMING_PROGRESS_TABLE] {
+        if !helper_table_exists(conn, helper_table)? {
+            continue;
+        }
+
+        let sql = format!(
+            r#"UPDATE {LAKE_CATALOG}."{helper_table}" SET table_name = {} WHERE table_name = {};"#,
+            quote_literal(new_table_id),
+            quote_literal(old_table_id)
+        );
+        conn.execute_batch(&sql).map_err(|source| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake helper table rename failed",
+                format_query_error_detail(&sql),
+                source: source
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn helper_table_exists(conn: &duckdb::Connection, table_name: &str) -> EtlResult<bool> {
+    let sql = format!(
+        "SELECT 1 FROM information_schema.tables WHERE table_catalog = {} AND table_name = {} \
+         LIMIT 1;",
+        quote_literal(LAKE_CATALOG),
+        quote_literal(table_name)
+    );
+    let mut statement = conn.prepare(&sql).map_err(|source| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake helper table lookup failed",
+            format_query_error_detail(&sql),
+            source: source
+        )
+    })?;
+    let mut rows = statement.query([]).map_err(|source| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake helper table lookup failed",
+            format_query_error_detail(&sql),
+            source: source
+        )
+    })?;
+
+    rows.next().map(|row| row.is_some()).map_err(|source| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake helper table row fetch failed",
+            format_query_error_detail(&sql),
+            source: source
+        )
+    })
+}
+
 fn helper_table_has_column(
     conn: &duckdb::Connection,
     table_name: &str,

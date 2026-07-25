@@ -268,6 +268,20 @@ pub(super) fn build_rename_column_sql_ducklake(
     format!("alter table {table_name} rename column {old_name} to {new_name}")
 }
 
+/// Builds a DuckLake `alter table rename to` statement.
+///
+/// DuckDB renames a table only inside its own schema, so the caller must have
+/// verified that both names share a schema.
+pub(super) fn build_rename_table_sql_ducklake(
+    old_table_name: &DuckLakeTableName,
+    new_table_name: &DuckLakeTableName,
+) -> String {
+    let old_qualified_name = qualified_lake_table_name(old_table_name);
+    let new_name = quote_identifier(new_table_name.table());
+
+    format!("alter table {old_qualified_name} rename to {new_name}")
+}
+
 /// Builds a DuckLake `alter table alter column set data type` statement.
 ///
 /// DuckDB applies its own implicit cast while rewriting the column, so a

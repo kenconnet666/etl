@@ -64,6 +64,39 @@ pub(super) async fn ensure_replay_epoch_table_exists(
     Ok(())
 }
 
+/// Re-keys the replay epoch row after a destination table rename.
+///
+/// The row is keyed by the destination table id, so a rename must carry it
+/// over or the table would silently fall back to the legacy epoch and replay
+/// already-applied batches.
+pub(super) async fn rename_table_replay_epoch(
+    pool: &PgPool,
+    metadata_schema: &str,
+    old_table_name: &DuckLakeTableName,
+    new_table_name: &DuckLakeTableName,
+) -> EtlResult<()> {
+    let epochs_table = replay_epochs_table_name(metadata_schema);
+    let sql = format!("update {epochs_table} set table_name = $1, updated_at = now() where table_name = $2;");
+    let old_table_id = old_table_name.id();
+    let new_table_id = new_table_name.id();
+
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(&new_table_id)
+        .bind(&old_table_id)
+        .execute(pool)
+        .await
+        .map_err(|source| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake replay epoch rename failed",
+                format!("old_table={old_table_id} new_table={new_table_id}"),
+                source: source
+            )
+        })?;
+
+    Ok(())
+}
+
 /// Reads the current replay epoch for a table.
 pub(super) async fn read_table_replay_epoch(
     pool: &PgPool,

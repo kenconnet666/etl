@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ducklake]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   msrv-sync-changes:
     name: Detect MSRV Sync Changes
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.filter.outputs.should_run }}
     steps:
@@ -66,7 +66,7 @@ jobs:
     name: MSRV Sync
     needs: msrv-sync-changes
     if: needs.msrv-sync-changes.outputs.should_run == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -92,7 +92,7 @@ jobs:
 
   check:
     name: Lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         check: [fmt, clippy, sort]
@@ -130,7 +130,7 @@ jobs:
 
   check-actions:
     name: Actions Lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -141,22 +141,8 @@ jobs:
           version: 1.7.12
 
   test-full:
-    name: Tests (Full, ${{ matrix.postgres_label }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      matrix:
-        include:
-          - postgres_label: postgres-18
-            postgres_version: 18
-            postgres_image: postgres:18
-            coverage: true
-          - postgres_label: postgres-17
-            postgres_version: 17
-            postgres_image: postgres:17
-            coverage: false
+    name: Tests (Postgres 18)
+    runs-on: ubuntu-latest
     env:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -164,12 +150,16 @@ jobs:
       POSTGRES_PORT: 5430
       POSTGRES_REPLICA_PORT: 6430
       POSTGRES_HOST: localhost
+      POSTGRES_VERSION: 18
+      POSTGRES_IMAGE: postgres:18
       TESTS_DATABASE_HOST: localhost
       TESTS_DATABASE_PORT: 5430
       TESTS_DATABASE_REPLICA_HOST: localhost
       TESTS_DATABASE_REPLICA_PORT: 6430
       TESTS_DATABASE_START_PORT: 5430
-      NUM_LOCAL_DATABASES: 4
+      # Two shards fit a two-core GitHub-hosted runner; each shard also starts a
+      # read replica.
+      NUM_LOCAL_DATABASES: 2
       TESTS_DATABASE_USERNAME: postgres
       TESTS_DATABASE_PASSWORD: postgres
       TESTS_DATABASE_TLS_ENABLED: "true"
@@ -187,11 +177,8 @@ jobs:
         with:
           key: test-full
 
-      - name: Start Docker Compose (${{ matrix.postgres_label }})
-        run: |
-          POSTGRES_IMAGE=${{ matrix.postgres_image }} \
-          POSTGRES_VERSION=${{ matrix.postgres_version }} \
-            cargo xtask postgres start
+      - name: Start Docker Compose
+        run: cargo xtask postgres start
 
       - name: Vendor DuckDB Extensions
         run: |
@@ -209,35 +196,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Run Unit and Integration Tests
-        if: matrix.coverage == false
-        run: |
-          cargo xtask nextest run
-
-      - name: Install cargo-llvm-cov
-        if: matrix.coverage == true
-        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
-        with:
-          tool: cargo-llvm-cov
+        run: cargo xtask nextest run
 
       - name: Run Doctests
-        run: |
-          cargo test --doc --workspace --all-features --no-fail-fast
-
-      - name: Run Unit and Integration Tests with Coverage
-        if: matrix.coverage == true
-        run: |
-          cargo xtask nextest llvm-cov
-
-      - name: Merge Coverage Data
-        if: matrix.coverage == true
-        run: |
-          cargo llvm-cov report --lcov --output-path lcov.info
-
-      - name: Upload Coverage to Coveralls
-        if: matrix.coverage == true
-        uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e # v2.3.7
-        with:
-          fail-on-error: false
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path-to-lcov: lcov.info
-          debug: true
+        run: cargo test --doc --workspace --all-features --no-fail-fast
