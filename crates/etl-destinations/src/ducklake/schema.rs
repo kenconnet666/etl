@@ -268,18 +268,38 @@ pub(super) fn build_rename_column_sql_ducklake(
     format!("alter table {table_name} rename column {old_name} to {new_name}")
 }
 
-/// Builds a DuckLake `alter table rename to` statement.
+/// Builds the statements that move a DuckLake table to a new name.
 ///
-/// DuckDB renames a table only inside its own schema, so the caller must have
-/// verified that both names share a schema.
-pub(super) fn build_rename_table_sql_ducklake(
+/// DuckDB renames a table only inside its own schema, so a source schema move
+/// is mirrored by recreating the table from the current schema, copying the
+/// rows, and dropping the original.
+pub(super) fn build_table_rename_sql_ducklake(
     old_table_name: &DuckLakeTableName,
     new_table_name: &DuckLakeTableName,
-) -> String {
+    column_schemas: &[ColumnSchema],
+) -> Vec<String> {
     let old_qualified_name = qualified_lake_table_name(old_table_name);
-    let new_name = quote_identifier(new_table_name.table());
 
-    format!("alter table {old_qualified_name} rename to {new_name}")
+    if old_table_name.schema() == new_table_name.schema() {
+        let new_name = quote_identifier(new_table_name.table());
+        return vec![format!("alter table {old_qualified_name} rename to {new_name}")];
+    }
+
+    let new_qualified_name = qualified_lake_table_name(new_table_name);
+    let copied_columns = column_schemas
+        .iter()
+        .map(|column_schema| quote_identifier(&column_schema.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    vec![
+        build_create_table_sql_ducklake(new_table_name, column_schemas),
+        format!(
+            "insert into {new_qualified_name} ({copied_columns}) select {copied_columns} from \
+             {old_qualified_name}"
+        ),
+        format!("drop table {old_qualified_name}"),
+    ]
 }
 
 /// Builds a DuckLake `alter table alter column set data type` statement.

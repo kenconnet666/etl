@@ -76,7 +76,9 @@ pub(super) async fn rename_table_replay_epoch(
     new_table_name: &DuckLakeTableName,
 ) -> EtlResult<()> {
     let epochs_table = replay_epochs_table_name(metadata_schema);
-    let sql = format!("update {epochs_table} set table_name = $1, updated_at = now() where table_name = $2;");
+    let sql = format!(
+        "update {epochs_table} set table_name = $1, updated_at = now() where table_name = $2;"
+    );
     let old_table_id = old_table_name.id();
     let new_table_id = new_table_name.id();
 

@@ -49,8 +49,8 @@ use crate::ducklake::{
         apply_table_batches_with_retry, ensure_applied_batches_table_exists,
         ensure_streaming_progress_table_exists, prepare_copy_complete_table_batch,
         prepare_copy_table_batch, prepare_mutation_table_batches, prepare_truncate_table_batch,
-        read_table_streaming_progress_sequence_key, retain_mutations_after_sequence_key,
-        retain_truncates_after_sequence_key,
+        read_table_streaming_progress_sequence_key, rename_helper_table_rows_blocking,
+        retain_mutations_after_sequence_key, retain_truncates_after_sequence_key,
     },
     client::{
         DuckLakeConnectionManager, DuckLakeInterruptRegistry, build_warm_ducklake_pool,
@@ -70,14 +70,15 @@ use crate::ducklake::{
     },
     replay_epoch::{
         begin_table_replay_epoch_transition, complete_table_replay_epoch_transition,
-        ensure_replay_epoch_table_exists, read_table_replay_epoch,
+        ensure_replay_epoch_table_exists, read_table_replay_epoch, rename_table_replay_epoch,
     },
     schema::{
         build_add_column_sql_ducklake, build_alter_column_nullability_sql_ducklake,
         build_alter_column_type_sql_ducklake, build_create_table_sql_ducklake,
         build_drop_column_sql_ducklake, build_drop_default_sql_ducklake,
         build_rename_column_sql_ducklake, build_set_default_sql_ducklake,
-        postgres_column_type_to_ducklake_sql, supports_column_default_ducklake,
+        build_table_rename_sql_ducklake, postgres_column_type_to_ducklake_sql,
+        supports_column_default_ducklake,
     },
     sql::qualified_lake_table_name,
 };
@@ -1529,6 +1530,12 @@ where
             metadata
         };
 
+        // A source rename keeps the table OID, so the destination table has to
+        // follow the new name before any column diff is applied to it.
+        let (metadata, table_name) = self
+            .follow_table_rename(table_id, metadata, &table_name, new_replicated_table_schema)
+            .await?;
+
         let current_snapshot_id = metadata.snapshot_id;
         let current_replication_mask = metadata.replication_mask.clone();
         if current_snapshot_id == new_snapshot_id
@@ -1607,6 +1614,111 @@ where
         );
 
         Ok(())
+    }
+
+    /// Follows a source table rename so the DuckLake table keeps mirroring the
+    /// source name.
+    ///
+    /// Postgres keeps the table OID across a rename, so without this the
+    /// destination would keep writing to the old table name forever. Helper
+    /// rows are keyed by the destination table id, so they are re-keyed too.
+    async fn follow_table_rename(
+        &self,
+        table_id: TableId,
+        metadata: DestinationTableMetadata,
+        current_table_name: &DuckLakeTableName,
+        target_schema: &ReplicatedTableSchema,
+    ) -> EtlResult<(DestinationTableMetadata, DuckLakeTableName)> {
+        let new_table_name = table_name_to_ducklake_table_name(target_schema.name())?;
+        if new_table_name == *current_table_name {
+            return Ok((metadata, current_table_name.clone()));
+        }
+
+        info!(
+            table_id = %table_id,
+            old_table = %current_table_name,
+            new_table = %new_table_name,
+            "ducklake following source table rename"
+        );
+
+        {
+            let _table_write_permit = self.acquire_table_write_slot(current_table_name).await?;
+            let _checkpoint_guard = self.acquire_mutation_guard().await;
+
+            let old_table_name = current_table_name.clone();
+            let renamed_table_name = new_table_name.clone();
+            let column_schemas: Vec<ColumnSchema> =
+                target_schema.column_schemas().cloned().collect();
+
+            run_duckdb_blocking(
+                Arc::clone(&self.pool),
+                Arc::clone(&self.blocking_slots),
+                move |conn| {
+                    let execute_ddl = |sql: &str, description: &'static str| -> EtlResult<()> {
+                        conn.execute_batch(sql).map_err(|source| {
+                            etl_error!(
+                                ErrorKind::DestinationQueryFailed,
+                                description,
+                                format_query_error_detail(sql),
+                                source: source
+                            )
+                        })
+                    };
+
+                    execute_ddl("begin transaction", "DuckLake DDL transaction failed")?;
+
+                    let rename_result = (|| -> EtlResult<()> {
+                        for sql in build_table_rename_sql_ducklake(
+                            &old_table_name,
+                            &renamed_table_name,
+                            &column_schemas,
+                        ) {
+                            execute_ddl(&sql, "DuckLake table rename failed")?;
+                        }
+
+                        rename_helper_table_rows_blocking(
+                            conn,
+                            &old_table_name.id(),
+                            &renamed_table_name.id(),
+                        )
+                    })();
+
+                    if let Err(error) = rename_result {
+                        if let Err(rollback_error) = conn.execute_batch("rollback") {
+                            warn!(
+                                error = %rollback_error,
+                                table = %old_table_name,
+                                "ducklake table rename rollback failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+
+                    execute_ddl("commit", "DuckLake DDL transaction commit failed")
+                },
+            )
+            .await?;
+        }
+
+        rename_table_replay_epoch(
+            &self.metadata_pg_pool,
+            &self.metadata_schema,
+            current_table_name,
+            &new_table_name,
+        )
+        .await?;
+
+        let mut metadata = metadata;
+        metadata.destination_table_id = new_table_name.to_metadata_id()?;
+        self.store.store_destination_table_metadata(table_id, metadata.clone()).await?;
+
+        {
+            let mut created_tables = self.created_tables.lock();
+            created_tables.remove(current_table_name);
+            created_tables.insert(new_table_name.clone());
+        }
+
+        Ok((metadata, new_table_name))
     }
 
     /// Applies a schema diff while serializing with table-local writes and
