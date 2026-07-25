@@ -3,7 +3,7 @@ use etl::{
     etl_error,
 };
 use pg_escape::quote_identifier;
-use rand::Rng;
+use rand::RngExt;
 use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::ducklake::DuckLakeTableName;

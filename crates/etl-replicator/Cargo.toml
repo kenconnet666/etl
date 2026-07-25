@@ -27,7 +27,7 @@ etl-destinations = { workspace = true }
 etl-maintenance = { workspace = true }
 etl-telemetry = { workspace = true }
 metrics = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+reqwest = { workspace = true, features = ["rustls", "json"] }
 rustls = { workspace = true, features = ["aws-lc-rs", "logging"] }
 secrecy = { workspace = true }
 sentry = { workspace = true }

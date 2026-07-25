@@ -124,7 +124,7 @@ where
             Some(certs) if !certs.is_empty() => TbsCertificate::from_der(&certs[0])
                 .ok()
                 .and_then(|cert| {
-                    let digest = match cert.signature.oid {
+                    let digest = match cert.signature().oid {
                         // Note: SHA1 is upgraded to SHA256 as per https://datatracker.ietf.org/doc/html/rfc5929#section-4.1
                         ID_SHA_1
                         | ID_SHA_256

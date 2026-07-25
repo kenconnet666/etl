@@ -31,7 +31,7 @@ use metrics::{counter, histogram};
 #[cfg(feature = "test-utils")]
 use parking_lot::Mutex;
 use pg_escape::quote_literal;
-use rand::Rng;
+use rand::RngExt;
 use tokio::{sync::Semaphore, time::Instant};
 use tokio_postgres::types::PgLsn;
 use tracing::{debug, trace, warn};

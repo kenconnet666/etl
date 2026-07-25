@@ -14,7 +14,7 @@ use etl::{
 use etl_postgres::tokio::test_utils::TableModification;
 use etl_telemetry::tracing::init_test_tracing;
 use pg_escape::{quote_identifier, quote_literal};
-use rand::{Rng, distr::Alphanumeric, random};
+use rand::{RngExt, distr::Alphanumeric, random};
 
 const LARGE_TEXT_SIZE_BYTES: usize = 8192;
 const INITIAL_ID: i64 = 1;
