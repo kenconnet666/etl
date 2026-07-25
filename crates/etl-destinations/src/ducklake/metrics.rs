@@ -10,7 +10,7 @@ use etl::{
 };
 use metrics::{Unit, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use parking_lot::Mutex;
-use pg_escape::{quote_identifier, quote_literal};
+use pg_escape::quote_identifier;
 use sqlx::{AssertSqlSafe, PgPool};
 use tokio::{
     sync::watch,
@@ -645,12 +645,20 @@ fn epoch_age_seconds(now_epoch_ms: i64, oldest_epoch_ms: Option<i64>) -> i64 {
 pub(super) fn resolve_ducklake_metadata_schema_blocking(
     conn: &duckdb::Connection,
 ) -> EtlResult<String> {
+    // DuckLake exposes its internal metadata as a virtual catalog named
+    // __ducklake_metadata_<catalog>.  In DuckDB ≥ 1.1.5 / DuckLake ≥ 1.1.5
+    // the catalog must be addressed with a fully-qualified prefix; the plain
+    // `information_schema` view only covers the current (memory) catalog and
+    // would return no rows for the metadata tables.
     let metadata_catalog = format!("__ducklake_metadata_{LAKE_CATALOG}");
+    let qualified_table = format!(
+        "{}.information_schema.tables",
+        quote_identifier(&metadata_catalog)
+    );
     let sql = format!(
         r#"SELECT table_schema
-           FROM information_schema.tables
-           WHERE table_catalog = {}
-             AND table_name = 'ducklake_snapshot'
+           FROM {qualified_table}
+           WHERE table_name = 'ducklake_snapshot'
            ORDER BY CASE
                WHEN table_schema = 'main' THEN 0
                WHEN table_schema = 'ducklake' THEN 1
@@ -658,7 +666,6 @@ pub(super) fn resolve_ducklake_metadata_schema_blocking(
            END,
            table_schema
            LIMIT 1;"#,
-        quote_literal(&metadata_catalog),
     );
     conn.query_row(&sql, [], |row| row.get::<_, String>(0)).map_err(|err| {
         etl_error!(
