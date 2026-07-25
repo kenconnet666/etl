@@ -355,6 +355,15 @@ where
     }
 }
 
+/// Returns whether a table can only be replicated as an append-only log.
+///
+/// A source table without a primary key and without `replica identity full`
+/// never sends a key image, so the destination cannot match existing rows. Such
+/// a table degrades to append-only instead of failing replication.
+fn is_ducklake_append_only(replicated_table_schema: &ReplicatedTableSchema) -> bool {
+    replicated_table_schema.identity_column_schemas().len() == 0
+}
+
 /// Validates that a replicated table schema can be applied to one DuckLake
 /// row-matching mutation.
 ///
@@ -1989,6 +1998,42 @@ where
                         );
                     }
                     Event::Update(update) => {
+                        if is_ducklake_append_only(&update.replicated_table_schema) {
+                            let table_id = update.replicated_table_schema.id();
+                            let replicated_table_schema = update.replicated_table_schema;
+                            let segments = table_id_to_mutations.entry(table_id).or_default();
+
+                            match update.updated_table_row {
+                                UpdatedTableRow::Full(table_row) => {
+                                    warn!(
+                                        table_name = %replicated_table_schema.name(),
+                                        "appending updated row because the source table has no \
+                                         replica identity"
+                                    );
+                                    let mutation = TrackedTableMutation::new(
+                                        update.start_lsn,
+                                        update.commit_lsn,
+                                        update.tx_ordinal,
+                                        TableMutation::Insert(table_row),
+                                    );
+                                    push_table_mutation_segment(
+                                        segments,
+                                        replicated_table_schema,
+                                        mutation,
+                                    );
+                                }
+                                UpdatedTableRow::Partial(_) => {
+                                    warn!(
+                                        table_name = %replicated_table_schema.name(),
+                                        "skipping partial update because the source table has no \
+                                         replica identity"
+                                    );
+                                }
+                            }
+
+                            continue;
+                        }
+
                         validate_ducklake_replica_identity(
                             &update.replicated_table_schema,
                             "update",
@@ -2057,6 +2102,14 @@ where
                         }
                     }
                     Event::Delete(delete) => {
+                        if is_ducklake_append_only(&delete.replicated_table_schema) {
+                            warn!(
+                                table_name = %delete.replicated_table_schema.name(),
+                                "skipping delete because the source table has no replica identity"
+                            );
+                            continue;
+                        }
+
                         validate_ducklake_replica_identity(
                             &delete.replicated_table_schema,
                             "delete",
