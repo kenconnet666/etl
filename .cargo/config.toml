@@ -14,3 +14,11 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[env]
+# Link against the official prebuilt libduckdb instead of compiling the bundled
+# DuckDB sources. The bundled build costs roughly ten minutes and 4.6 GB of
+# object files per distinct build fingerprint, and `cargo build`, `cargo clippy`,
+# and `cargo nextest` each own a different fingerprint. The archive is downloaded
+# once into `<target-dir>/duckdb-download` and reused afterwards.
+DUCKDB_DOWNLOAD_LIB = "1"

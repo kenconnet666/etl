@@ -83,6 +83,10 @@ USER nonroot:nonroot
 COPY --from=builder /app/target/release/etl-replicator ./etl-replicator
 COPY --from=builder /app/target/release/etl-ducklake-maintenance ./etl-ducklake-maintenance
 COPY --from=duckdb-extensions /duckdb_extensions ./duckdb_extensions
+# The binaries link against the prebuilt libduckdb downloaded during the build
+# instead of statically bundling the DuckDB sources, so ship the library too.
+COPY --from=builder /app/target/release/deps/libduckdb.so ./libduckdb.so
+ENV LD_LIBRARY_PATH=/app
 
 # Use exec form for proper signal handling.
 ENTRYPOINT ["./etl-replicator"]
