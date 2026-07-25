@@ -1,6 +1,7 @@
 //! Pipeline runtime helpers.
 
 use etl::{destination::PipelineDestination, pipeline::Pipeline, store::PipelineStore};
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 
@@ -28,28 +29,34 @@ where
     // Spawn a task to listen for shutdown signals and trigger shutdown.
     let shutdown_tx = pipeline.shutdown_tx();
     let shutdown_handle = tokio::spawn(async move {
-        // Listen for SIGTERM, sent by Kubernetes before SIGKILL during pod termination.
-        //
-        // If the process is killed before shutdown completes, the pipeline may become
-        // corrupted, depending on the store and destination
-        // implementations.
-        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-            error!("failed to register sigterm handler, shutting down pipeline");
+        #[cfg(unix)]
+        {
+            // Listen for SIGTERM, sent by Kubernetes before SIGKILL during pod
+            // termination. Not available on Windows; ctrl_c covers that case.
+            let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+                error!("failed to register sigterm handler, shutting down pipeline");
 
-            if let Err(err) = shutdown_tx.shutdown() {
-                warn!(error = %err, "failed to send shutdown signal");
-            }
+                if let Err(err) = shutdown_tx.shutdown() {
+                    warn!(error = %err, "failed to send shutdown signal");
+                }
 
-            return;
-        };
+                return;
+            };
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("sigint (ctrl+c) received, shutting down pipeline");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("sigint (ctrl+c) received, shutting down pipeline");
+                }
+                _ = sigterm.recv() => {
+                    info!("sigterm received, shutting down pipeline");
+                }
             }
-            _ = sigterm.recv() => {
-                info!("sigterm received, shutting down pipeline");
-            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("sigint (ctrl+c) received, shutting down pipeline");
         }
 
         if let Err(err) = shutdown_tx.shutdown() {
