@@ -52,6 +52,34 @@ APP_ENVIRONMENT=dev cargo run --release
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the local stack, migrations, and tests.
 
+## Performance
+
+Measured on one developer machine (WSL2 Debian, Postgres 18 source, Postgres 18
+DuckLake catalog, local data path so object-storage latency stays out of the
+numbers). Throughput is `rows * 1000 / elapsed_ms`; these are single observations
+rather than percentiles, and the source write time is reported alongside rather
+than subtracted, so each figure is end to end.
+
+| Scenario | Rows | Source write | To the replica | Rows/s |
+| --- | --- | --- | --- | --- |
+| Initial copy, catching up a backlog | 100,000 | 847 ms | 22,865 ms | 4,373 |
+| Streaming insert | 100,000 | 883 ms | 4,421 ms | 22,619 |
+| Streaming insert, 4 tables | 75,000 | 1,348 ms | 2,256 ms | 33,244 |
+| Interleaved insert/update/delete | 50,000 | 1,938 ms | 8,507 ms | 5,877 |
+| Warm update | 100,000 | 873 ms | 43,424 ms | 2,302 |
+| Warm delete | 50,000 | 154 ms | 22,542 ms | 2,218 |
+
+Comparing the same scenarios at 5,000 and 100,000 rows separates the fixed cost
+from the per-row cost: an insert costs about 0.031 ms per row, an update or
+delete about 0.42 ms, and the initial copy carries roughly 17 seconds of fixed
+cost that is not in the write path. So the insert path is close to saturating
+what the destination can absorb, while the delete path is bounded by how the
+delete predicate is expressed rather than by row volume.
+
+`scripts/bin/bench-replica.sh` reproduces these numbers, and
+[DEVELOPMENT.md](DEVELOPMENT.md) documents the measurement scope, the known gaps,
+and the local environment traps that distort results.
+
 ## Recovering from divergence
 
 The replica holds no authority over the data, so recovery is a fresh copy rather

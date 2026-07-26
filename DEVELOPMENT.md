@@ -18,6 +18,38 @@ bundled sources. `.cargo/config.toml` sets `DUCKDB_DOWNLOAD_LIB=1`, so the first
 build downloads the library once into `<target-dir>/duckdb-download` and reuses
 it afterwards.
 
+### Working from Windows
+
+The toolchain runs inside WSL2 while the repository can live on the Windows side.
+That works, but two things are worth setting up because they cost real time:
+
+Point `CARGO_TARGET_DIR` at a path inside the Linux filesystem. A target
+directory on `/mnt/c` makes every build and test run several times slower, and
+the DuckDB library download lands there too.
+
+```bash
+# ~/.etl-dev.env, sourced by every helper script
+export ETL_REPO_DIR=/mnt/c/path/to/etl
+export CARGO_TARGET_DIR="$HOME/.cache/etl-target"
+export ETL_DUCKDB_EXTENSION_ROOT="$ETL_REPO_DIR/vendor/duckdb/extensions"
+export TESTS_DATABASE_HOST=localhost
+export TESTS_DATABASE_PORT=5430
+export TESTS_DATABASE_USERNAME=postgres
+export TESTS_DATABASE_PASSWORD=postgres
+```
+
+Keep the working tree on LF. `git config core.autocrlf input` avoids a diff that
+touches every file, and the formatter check in CI fails on CRLF.
+
+Long-running work should not be a child of `wsl.exe`: the process is killed when
+the launching shell exits. Run it under systemd instead, writing its log to a
+path inside the Linux filesystem.
+
+```bash
+systemd-run --unit=etl-bench --collect --setenv=HOME=/root bash /path/to/script.sh
+journalctl -u etl-bench --no-pager | tail
+```
+
 ## Task runner
 
 Common tasks live in `crates/xtask`, reachable through the `cargo x` alias.
@@ -138,6 +170,87 @@ Replication is asynchronous, so a difference on a table that is being written to
 may just be lag; rerun and see whether it persists. `etl-resync` has to run
 while the replicator is stopped, because a running replicator keeps table state
 in memory.
+
+## Benchmarking
+
+`scripts/bin/bench-replica.sh` drives the replicator through six scenarios and
+reports what each clock covers, because the scenarios are not comparable
+otherwise.
+
+```bash
+DESTINATION=ducklake ROWS=100000 TABLES=4 scripts/bin/bench-replica.sh
+DESTINATION=doris ROWS=100000 TABLES=4 scripts/bin/bench-replica.sh
+```
+
+| Scenario | What the clock covers |
+| --- | --- |
+| `catchup` | The replicator is stopped, rows are written to build a backlog, then the clock runs from replicator start until the destination count matches. Includes reconnect and a cold table. |
+| `streaming insert` | The replicator is already running; covers the source write and the wait for the destination to match. |
+| `warm update` / `warm delete` | Like streaming, but against rows the table already holds. |
+| `multi-table insert` | Concurrent writes to several tables. |
+| `interleaved i/u/d` | Inserts, updates, and deletes mixed inside one transaction, which is what a real change stream looks like. |
+
+Throughput is `rows * 1000 / elapsed_ms`, floored. Source write time is reported
+separately and not subtracted, so a streaming number is end to end. These are
+single observations, not percentiles.
+
+Set `LAKE_DATA_PATH` to a local directory to keep object-storage latency out of
+the numbers. After each run the script scrapes
+`etl_ducklake_batch_stage_duration_seconds` from the replicator's Prometheus
+endpoint on port 9000, which splits a batch into `begin`, `upsert`, `delete`,
+`update`, `marker`, and `commit`. Reach for that distribution before optimising
+anything; the stage totals are what turned several guesses into measurements.
+
+### Local environment traps
+
+These cost hours to rediscover:
+
+- **rustfs beta fails HTTP transfers intermittently** under benchmark load, which
+  exhausts batch retries and stops the replicator. It is not a configuration
+  difference and not specific to any column type. Point `LAKE_DATA_PATH` at a
+  local directory for measurements.
+- **A repository on a `/mnt/c` 9p mount can hand cargo a stale copy of a file you
+  just edited**, so a build succeeds against old source. The benchmark and check
+  scripts `touch` recently modified files first; do the same in any new script.
+- **Repeated benchmark runs exhaust the source's replication slots.** The script
+  drops inactive slots first; a manual run may need
+  `select pg_drop_replication_slot(slot_name) from pg_replication_slots where not active`.
+- **Leftover DuckLake catalog rows reject a new attach** when the data path
+  differs by as much as a `file://` prefix. Wipe `ducklake%` tables from the
+  catalog between runs with a different data path.
+
+### Where the time goes
+
+Measured on one machine with a local data path, comparing 5000 rows against
+100000 rows to separate the fixed cost from the per-row cost:
+
+| Path | Per row | Fixed |
+| --- | --- | --- |
+| Streaming insert | ~0.031 ms | ~1.3 s |
+| Warm update / delete | ~0.42 ms | ~1 s |
+| Initial copy | ~0.06 ms | ~17 s |
+
+The insert path is in the same range as the reference implementation this fork
+was measured against. Two gaps remain, both with a known cause:
+
+**Deletes cost 13x more per row than inserts.** A batch already collapses into a
+single delete, so the cost is now the predicate list itself: a delete of 100000
+keys builds an expression with 100000 `OR` branches, which cannot use column
+statistics to prune. Writing the keys into a staging table and matching with
+`DELETE FROM t WHERE EXISTS (SELECT 1 FROM stg s WHERE t.k = s.k)` turns that
+into one hash join. This is the largest known win left.
+
+**The initial copy pays about 17 seconds of fixed cost** that is not in the write
+path: writing 5000 rows spends 0.33 s in the `upsert` stage. It is spread across
+pipeline startup, table creation, and table state transitions, none of which the
+current stage timings cover. Extending the timings to the table sync worker is
+the prerequisite for reducing it.
+
+Two smaller items: a DuckLake commit measures about 108 ms against roughly 23 ms
+for the reference implementation, cause not yet investigated; and
+`arrow_column_kinds` returns `None` for UUID, JSON, and JSONB, so one such column
+sends a whole table down the row-by-row appender path. Staging already carries
+JSON as text, so `Utf8` would match.
 
 ## Migrations
 
