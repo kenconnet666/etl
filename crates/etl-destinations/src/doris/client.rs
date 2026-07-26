@@ -303,13 +303,17 @@ pub(super) fn build_stream_load_label(
     format!("etl_{pipeline_id}_{table}_{commit_lsn:016x}_{tx_ordinal:016x}_{batch_index}")
 }
 
-/// Builds the deterministic Stream Load label for a table-copy batch.
+/// Builds the Stream Load label for a table-copy batch.
+///
+/// The run nonce keeps the label distinct from an earlier run's, because a copy
+/// recreates the table and must not be skipped as a duplicate.
 pub(super) fn build_copy_stream_load_label(
     pipeline_id: u64,
     table: &str,
+    run_nonce: u64,
     batch_sequence: u64,
 ) -> String {
-    format!("etl_copy_{pipeline_id}_{table}_{batch_sequence:016x}")
+    format!("etl_copy_{pipeline_id}_{table}_{run_nonce:016x}_{batch_sequence:016x}")
 }
 
 #[cfg(test)]
@@ -378,8 +382,8 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first, "etl_1_public_users_0000000000001234_0000000000000005_0");
         assert_eq!(
-            build_copy_stream_load_label(42, "public_orders", 7),
-            "etl_copy_42_public_orders_0000000000000007"
+            build_copy_stream_load_label(42, "public_orders", 0xabc, 7),
+            "etl_copy_42_public_orders_0000000000000abc_0000000000000007"
         );
     }
 }
