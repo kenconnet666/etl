@@ -24,6 +24,7 @@ DESTINATION="${DESTINATION:-ducklake}"
 ROWS="${ROWS:-100000}"
 TABLES="${TABLES:-4}"
 SOURCE_DSN="${SOURCE_DSN:-postgres://postgres:changeme@localhost:15432/postgres}"
+CATALOG_DSN="${CATALOG_DSN:-postgres://lake_admin:changeme@localhost:15434/ducklake_catalog}"
 CATALOG_CONNINFO="${CATALOG_CONNINFO:-host=localhost port=15434 dbname=ducklake_catalog user=lake_admin password=changeme}"
 DUCKDB="${DUCKDB:-duckdb}"
 LAKE_DATA_PATH="${LAKE_DATA_PATH:-s3://lake/ducklake}"
@@ -70,13 +71,15 @@ source_sql() { psql "$SOURCE_DSN" -v ON_ERROR_STOP=1 -q -c "$1"; }
 now_ms() { date +%s%3N; }
 
 # Returns the destination row count for one table.
+#
+# The polling query only loads the extensions rather than installing them, since
+# installing costs about a second and would land inside every measurement that
+# waits for a result.
 dest_count() {
   local table="$1"
   if [[ "$DESTINATION" == "ducklake" ]]; then
     "$DUCKDB" -noheader -list -c "
-      install ducklake; load ducklake;
-      install postgres; load postgres;
-      install httpfs; load httpfs;
+      load ducklake; load postgres; load httpfs;
       $LAKE_SECRET_SQL
       attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path '$LAKE_DATA_PATH', override_data_path true);
       select 'N=' || cast(count(*) as varchar) from lake.public.\"$table\";
@@ -278,6 +281,11 @@ fill() {
            now()
     from generate_series(1, $count) g(i)"
 }
+
+if [[ "$DESTINATION" == "ducklake" ]]; then
+  # Install once so the polling queries only have to load.
+  "$DUCKDB" -c "install ducklake; install postgres; install httpfs;" > /dev/null 2>&1 || true
+fi
 
 echo
 echo "destination=$DESTINATION rows=$ROWS tables=$TABLES"

@@ -565,18 +565,42 @@ pub(super) async fn build_warm_ducklake_pool(
                 )
             })?;
 
-        let mut warmed_connections = Vec::with_capacity(pool_size as usize);
-        for _ in 0..pool_size {
-            let conn = pool.get().map_err(|e| {
-                etl_error!(
-                    ErrorKind::DestinationConnectionFailed,
-                    "Failed to warm DuckLake connection pool",
-                    source: e
-                )
-            })?;
-            warmed_connections.push(conn);
+        // Initializing a connection takes about a second, and the two pools hold
+        // four each, so warming them one at a time would put several seconds in
+        // front of the first copy batch.
+        let warm_results: Vec<EtlResult<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..pool_size)
+                .map(|_| {
+                    let pool = pool.clone();
+                    scope.spawn(move || -> EtlResult<()> {
+                        let conn = pool.get().map_err(|e| {
+                            etl_error!(
+                                ErrorKind::DestinationConnectionFailed,
+                                "Failed to warm DuckLake connection pool",
+                                source: e
+                            )
+                        })?;
+                        drop(conn);
+                        Ok(())
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(etl_error!(
+                            ErrorKind::DestinationConnectionFailed,
+                            "DuckLake connection warm-up thread panicked"
+                        ))
+                    })
+                })
+                .collect()
+        });
+        for result in warm_results {
+            result?;
         }
-        drop(warmed_connections);
 
         trace!(
             purpose,
