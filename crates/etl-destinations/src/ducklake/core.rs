@@ -23,7 +23,7 @@ use etl::{
     },
     store::{DestinationStore, TableStateType},
 };
-use etl_config::ducklake_catalog_metadata_connect_options;
+use etl_config::{ducklake_catalog_metadata_connect_options, shared::SchemaFollowConfig};
 use metrics::{gauge, histogram};
 use parking_lot::Mutex;
 use pg_escape::{quote_identifier as quote_postgres_identifier, quote_literal};
@@ -183,6 +183,8 @@ pub struct DuckLakeDestination<S> {
     store: S,
     /// Cache of table names whose DDL has already been executed.
     created_tables: Arc<Mutex<HashSet<DuckLakeTableName>>>,
+    /// Which source schema changes this destination follows.
+    schema_follow: SchemaFollowConfig,
     /// Destination table name per source table, for tables known to exist and
     /// to have their schema applied.
     ///
@@ -575,6 +577,32 @@ fn tombstone_columns_to_cleanup_ducklake(
         })
         .cloned()
         .collect()
+}
+
+/// Removes the schema changes the destination is configured not to follow.
+///
+/// Adding a column and renaming one only add information, so they are always
+/// followed. Dropping a column and retyping one discard data in the replica, so
+/// a deployment can keep the existing shape and reconcile by hand instead.
+fn filter_schema_diff_for_follow(diff: &SchemaDiff, follow: SchemaFollowConfig) -> SchemaDiff {
+    if follow.drop_column && follow.change_type {
+        return diff.clone();
+    }
+
+    let mut filtered = diff.clone();
+    if !follow.drop_column {
+        filtered.columns_to_remove.clear();
+    }
+    if !follow.change_type {
+        for change in &mut filtered.columns_to_change {
+            change
+                .modifications
+                .retain(|modification| !matches!(modification, ColumnModification::Type { .. }));
+        }
+        filtered.columns_to_change.retain(|change| !change.modifications.is_empty());
+    }
+
+    filtered
 }
 
 /// Plans idempotent DuckLake schema DDL for the current destination columns.
@@ -1130,6 +1158,7 @@ where
             maintenance_target_file_size,
             expire_snapshots_older_than,
             DuckLakeExternalMaintenanceConfig::default(),
+            SchemaFollowConfig::default(),
             store,
         )
         .await
@@ -1147,6 +1176,7 @@ where
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
         external_maintenance: DuckLakeExternalMaintenanceConfig,
+        schema_follow: SchemaFollowConfig,
         store: S,
     ) -> EtlResult<Self> {
         register_metrics();
@@ -1332,6 +1362,7 @@ where
             table_write_slots: Arc::default(),
             store,
             created_tables: Arc::clone(&created_tables),
+            schema_follow,
             ready_table_names: Arc::clone(&ready_table_names),
             applied_batches_table_created,
             streaming_progress_table_created,
@@ -1807,6 +1838,8 @@ where
         table_name: &DuckLakeTableName,
         diff: &SchemaDiff,
     ) -> EtlResult<()> {
+        let filtered = filter_schema_diff_for_follow(diff, self.schema_follow);
+        let diff = &filtered;
         if diff.is_empty() {
             debug!(table = %table_name, "ducklake schema diff is empty");
             return Ok(());
@@ -4010,5 +4043,60 @@ mod tests {
             assert!(metrics.files_scheduled_for_deletion_bytes >= 0);
             assert!(metrics.oldest_scheduled_deletion_age_seconds >= 0);
         }
+    }
+
+    #[test]
+    fn schema_follow_keeps_additions_and_renames() {
+        let removed = ColumnSchema::new("gone".to_owned(), PgType::TEXT, -1, 1, true);
+        let diff = SchemaDiff {
+            columns_to_add: vec![ColumnSchema::new("added".to_owned(), PgType::TEXT, -1, 2, true)],
+            columns_to_remove: vec![removed],
+            columns_to_change: vec![ColumnChange {
+                old_column: ColumnSchema::new("renamed".to_owned(), PgType::INT4, -1, 3, true),
+                new_column: ColumnSchema::new("renamed_new".to_owned(), PgType::INT4, -1, 3, true),
+                ordinal_position: 3,
+                modifications: vec![ColumnModification::Rename {
+                    old_name: "renamed".to_owned(),
+                    new_name: "renamed_new".to_owned(),
+                }],
+            }],
+        };
+
+        let filtered = filter_schema_diff_for_follow(
+            &diff,
+            SchemaFollowConfig { drop_column: false, change_type: false, truncate: true },
+        );
+
+        assert_eq!(filtered.columns_to_add.len(), 1);
+        assert!(filtered.columns_to_remove.is_empty());
+        assert_eq!(filtered.columns_to_change.len(), 1);
+    }
+
+    #[test]
+    fn schema_follow_can_drop_a_type_change_on_its_own() {
+        let diff = SchemaDiff {
+            columns_to_add: Vec::new(),
+            columns_to_remove: Vec::new(),
+            columns_to_change: vec![ColumnChange {
+                old_column: ColumnSchema::new("amount".to_owned(), PgType::INT4, -1, 1, true),
+                new_column: ColumnSchema::new("amount".to_owned(), PgType::INT8, -1, 1, true),
+                ordinal_position: 1,
+                modifications: vec![ColumnModification::Type {
+                    old_type: PgType::INT4,
+                    old_modifier: -1,
+                    new_type: PgType::INT8,
+                    new_modifier: -1,
+                }],
+            }],
+        };
+
+        let kept = filter_schema_diff_for_follow(&diff, SchemaFollowConfig::default());
+        assert_eq!(kept.columns_to_change.len(), 1);
+
+        let dropped = filter_schema_diff_for_follow(
+            &diff,
+            SchemaFollowConfig { drop_column: true, change_type: false, truncate: true },
+        );
+        assert!(dropped.is_empty());
     }
 }

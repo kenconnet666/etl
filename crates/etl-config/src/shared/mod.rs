@@ -14,6 +14,7 @@ pub use connection::{
 };
 pub use destination::{
     DestinationConfig, DestinationConfigWithoutSecrets, DestinationKind, DuckLakeMaintenanceMode,
+    SchemaFollowConfig,
 };
 pub use pipeline::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PipelineConfig,

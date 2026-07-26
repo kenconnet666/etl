@@ -396,7 +396,7 @@ where
                         &surrogate_key,
                     )?;
                     let key = merge_key(&buffer.layout, &row);
-                    buffer.push_full(key, row);
+                    buffer.set(key, row);
                 }
                 Event::Update(update) => {
                     let commit_lsn = update.commit_lsn.into();
@@ -434,11 +434,11 @@ where
                                     delete_row_to_json(&buffer.schema, &buffer.layout, old_row)?;
                                 let old_key = merge_key(&buffer.layout, &delete);
                                 if old_key != key {
-                                    buffer.push_full(old_key, delete);
+                                    buffer.set(old_key, delete);
                                 }
                             }
 
-                            buffer.push_full(key, row);
+                            buffer.set(key, row);
                         }
                         UpdatedTableRow::Partial(partial_row) => {
                             if buffer.layout.append_only {
@@ -453,8 +453,7 @@ where
                                     &buffer.layout,
                                     &partial_row,
                                 )?;
-                                let key = merge_key(&buffer.layout, &row);
-                                buffer.push_partial(columns, key, row);
+                                buffer.push_partial(columns, row);
                             }
                         }
                     }
@@ -486,7 +485,7 @@ where
 
                     let row = delete_row_to_json(&buffer.schema, &buffer.layout, &old_row)?;
                     let key = merge_key(&buffer.layout, &row);
-                    buffer.push_full(key, row);
+                    buffer.set(key, row);
                 }
                 Event::Truncate(truncate) => {
                     self.flush(&mut buffers, &mut batch_index).await?;
@@ -522,6 +521,7 @@ where
     ) -> EtlResult<()> {
         for buffer in buffers.drain().map(|(_, buffer)| buffer) {
             let table_name = self.table_name(&buffer.schema);
+            let full_column_names = column_names(&buffer.schema, &buffer.layout);
             let (commit_lsn, tx_ordinal) = buffer.position;
             let next_label = |batch_index: &mut u32| {
                 let label = build_stream_load_label(
@@ -535,17 +535,16 @@ where
                 label
             };
 
-            // Segments load in event order, so a later conflicting row always
-            // gets the higher Doris version.
-            for segment in buffer.segments {
+            // A collapsed batch is one load; a partial update adds one more.
+            for segment in buffer.into_segments() {
                 let label = next_label(batch_index);
                 match segment.partial_columns {
                     Some(columns) => {
                         self.load(&table_name, &label, &columns, true, segment.rows).await?;
                     }
                     None => {
-                        let columns = column_names(&buffer.schema, &buffer.layout);
-                        self.load(&table_name, &label, &columns, false, segment.rows).await?;
+                        self.load(&table_name, &label, &full_column_names, false, segment.rows)
+                            .await?;
                     }
                 }
             }
@@ -662,8 +661,17 @@ where
 struct TableBuffer {
     schema: ReplicatedTableSchema,
     layout: DorisTableLayout,
-    /// Loads to issue in event order.
-    segments: Vec<LoadSegment>,
+    /// Collapsed effect on each key, in first-seen order. [`None`] means the
+    /// key ends up deleted, and carries the row that expresses that
+    /// deletion.
+    keyed: Vec<(String, Option<Value>)>,
+    /// Position of each key in `keyed`.
+    positions: HashMap<String, usize>,
+    /// Rows with no key image, kept in arrival order.
+    unkeyed: Vec<Value>,
+    /// Partial updates, which cannot be collapsed because they leave the
+    /// columns the source did not send untouched.
+    partials: Vec<(Vec<String>, Value)>,
     /// Source position of the last buffered event, used to derive load labels.
     position: (u64, u64),
 }
@@ -673,41 +681,94 @@ impl TableBuffer {
     fn new(schema: ReplicatedTableSchema) -> Self {
         let layout = DorisTableLayout::from_schema(&schema);
 
-        Self { schema, layout, segments: Vec::new(), position: (0, 0) }
+        Self {
+            schema,
+            layout,
+            keyed: Vec::new(),
+            positions: HashMap::new(),
+            unkeyed: Vec::new(),
+            partials: Vec::new(),
+            position: (0, 0),
+        }
     }
 
-    /// Appends a row that carries the full declared column set.
-    fn push_full(&mut self, key: Option<String>, row: Value) {
-        push_segment_row(&mut self.segments, None, key, row);
+    /// Records what this batch leaves stored under one key.
+    ///
+    /// A later change to the same key replaces an earlier one, so a mixed
+    /// stream of inserts, updates, and deletes collapses to one row per key
+    /// and fits in a single load.
+    fn set(&mut self, key: Option<String>, row: Value) {
+        let Some(key) = key else {
+            self.unkeyed.push(row);
+            return;
+        };
+
+        match self.positions.get(&key) {
+            Some(&position) => self.keyed[position].1 = Some(row),
+            None => {
+                self.positions.insert(key.clone(), self.keyed.len());
+                self.keyed.push((key, Some(row)));
+            }
+        }
     }
 
-    /// Appends a row that carries only the columns the source sent.
-    fn push_partial(&mut self, columns: Vec<String>, key: Option<String>, row: Value) {
-        push_segment_row(&mut self.segments, Some(columns), key, row);
+    /// Records a partial update, which runs after the collapsed load.
+    fn push_partial(&mut self, columns: Vec<String>, row: Value) {
+        self.partials.push((columns, row));
+    }
+
+    /// Builds the loads for this buffer, in the order they must run.
+    fn into_segments(self) -> Vec<LoadSegment> {
+        build_segments(&self.layout, self.keyed, self.unkeyed, self.partials)
     }
 }
 
-/// Appends a row to the last segment, starting a new one when it cannot take
-/// it.
-fn push_segment_row(
-    segments: &mut Vec<LoadSegment>,
-    partial_columns: Option<Vec<String>>,
-    key: Option<String>,
-    row: Value,
-) {
-    let reusable = segments.last().is_some_and(|segment| {
-        segment.partial_columns == partial_columns
-            && key.as_ref().is_none_or(|key| !segment.keys.contains(key))
-    });
-    if !reusable {
-        segments.push(LoadSegment { partial_columns, rows: Vec::new(), keys: HashSet::new() });
+/// Turns a collapsed batch into the loads that apply it.
+///
+/// The collapsed rows share one load, because collapsing leaves at most one row
+/// per key. A partial update declares its own column set and uses a different
+/// write mode, so it cannot join them.
+fn build_segments(
+    layout: &DorisTableLayout,
+    keyed: Vec<(String, Option<Value>)>,
+    unkeyed: Vec<Value>,
+    partials: Vec<(Vec<String>, Value)>,
+) -> Vec<LoadSegment> {
+    let mut segments = Vec::new();
+
+    let mut rows = Vec::with_capacity(keyed.len() + unkeyed.len());
+    for (_, row) in keyed {
+        if let Some(row) = row {
+            rows.push(row);
+        }
+    }
+    rows.extend(unkeyed);
+    if !rows.is_empty() {
+        segments.push(LoadSegment { partial_columns: None, rows, keys: HashSet::new() });
     }
 
-    let segment = segments.last_mut().expect("a segment exists because one was just ensured");
-    if let Some(key) = key {
-        segment.keys.insert(key);
+    for (columns, row) in partials {
+        let key = merge_key(layout, &row);
+        let reusable = segments.last().is_some_and(|segment| {
+            segment.partial_columns.as_ref() == Some(&columns)
+                && key.as_ref().is_none_or(|key| !segment.keys.contains(key))
+        });
+        if !reusable {
+            segments.push(LoadSegment {
+                partial_columns: Some(columns),
+                rows: Vec::new(),
+                keys: HashSet::new(),
+            });
+        }
+
+        let segment = segments.last_mut().expect("a segment was just ensured");
+        if let Some(key) = key {
+            segment.keys.insert(key);
+        }
+        segment.rows.push(row);
     }
-    segment.rows.push(row);
+
+    segments
 }
 
 /// One Stream Load worth of rows for a single table.
@@ -947,55 +1008,72 @@ mod tests {
         DorisTableLayout { key_columns: vec![SURROGATE_KEY_COLUMN.to_owned()], append_only: true }
     }
 
-    /// Runs the real segment logic and returns the row count of each segment.
+    /// Runs the real collapse logic and returns the row count of each segment.
     fn segments_of(
         layout: DorisTableLayout,
         rows: Vec<(Option<Vec<String>>, Value)>,
     ) -> Vec<usize> {
-        let mut segments: Vec<LoadSegment> = Vec::new();
+        let mut keyed: Vec<(String, Option<Value>)> = Vec::new();
+        let mut positions: HashMap<String, usize> = HashMap::new();
+        let mut unkeyed = Vec::new();
+        let mut partials = Vec::new();
+
         for (partial_columns, row) in rows {
-            let key = merge_key(&layout, &row);
-            push_segment_row(&mut segments, partial_columns, key, row);
+            match partial_columns {
+                Some(columns) => partials.push((columns, row)),
+                None => match merge_key(&layout, &row) {
+                    Some(key) => match positions.get(&key) {
+                        Some(&position) => keyed[position].1 = Some(row),
+                        None => {
+                            positions.insert(key.clone(), keyed.len());
+                            keyed.push((key, Some(row)));
+                        }
+                    },
+                    None => unkeyed.push(row),
+                },
+            }
         }
 
-        segments.iter().map(|segment| segment.rows.len()).collect()
+        build_segments(&layout, keyed, unkeyed, partials)
+            .iter()
+            .map(|segment| segment.rows.len())
+            .collect()
     }
 
     #[test]
-    fn distinct_keys_share_one_segment() {
+    fn changes_to_distinct_keys_share_one_load() {
         let rows = vec![(None, json!({ "id": 1 })), (None, json!({ "id": 2 }))];
         assert_eq!(segments_of(keyed_layout(), rows), vec![2]);
     }
 
     #[test]
-    fn a_repeated_key_opens_a_new_segment() {
-        // Doris does not define which row wins inside one load, so the second
-        // change to the same key has to become its own higher-version load.
+    fn repeated_changes_to_one_key_collapse_into_one_row() {
+        // Doris does not define which row wins inside one load, so the batch
+        // collapses by key rather than opening another load.
         let rows = vec![
-            (None, json!({ "id": 1 })),
+            (None, json!({ "id": 1, "v": "first" })),
             (None, json!({ "id": 2 })),
-            (None, json!({ "id": 1 })),
+            (None, json!({ "id": 1, "v": "second" })),
         ];
-        assert_eq!(segments_of(keyed_layout(), rows), vec![2, 1]);
+        assert_eq!(segments_of(keyed_layout(), rows), vec![2]);
     }
 
     #[test]
-    fn a_partial_column_set_opens_a_new_segment() {
+    fn a_partial_column_set_opens_a_new_load() {
         // A partial load declares its own column set and uses a different write
-        // mode, so mixing it into a full load would reorder the two.
+        // mode, so it cannot share a load with the collapsed rows.
         let rows = vec![
             (None, json!({ "id": 1 })),
             (Some(vec!["id".to_owned(), "name".to_owned()]), json!({ "id": 2 })),
-            (None, json!({ "id": 3 })),
         ];
-        assert_eq!(segments_of(keyed_layout(), rows), vec![1, 1, 1]);
+        assert_eq!(segments_of(keyed_layout(), rows), vec![1, 1]);
     }
 
     #[test]
-    fn append_only_rows_never_split_a_segment() {
+    fn append_only_rows_all_share_one_load() {
         let rows = vec![
             (None, json!({ SURROGATE_KEY_COLUMN: "a" })),
-            (None, json!({ SURROGATE_KEY_COLUMN: "a" })),
+            (None, json!({ SURROGATE_KEY_COLUMN: "b" })),
         ];
         assert_eq!(segments_of(append_only_layout(), rows), vec![2]);
     }

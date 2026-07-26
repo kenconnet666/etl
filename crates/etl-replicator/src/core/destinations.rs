@@ -150,6 +150,7 @@ mod ducklake {
             maintenance_target_file_size,
             expire_snapshots_older_than,
             maintenance_mode,
+            schema_follow,
         } = &replicator_config.destination
         else {
             return Err(ReplicatorError::config(std::io::Error::other(
@@ -192,6 +193,7 @@ mod ducklake {
             maintenance_target_file_size.clone(),
             expire_snapshots_older_than.clone(),
             external_maintenance,
+            *schema_follow,
             store.clone(),
         )
         .await?;

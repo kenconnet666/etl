@@ -3,6 +3,40 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
+/// Which source schema changes a destination follows.
+///
+/// Adding a column and renaming one only ever add information, so they are
+/// always followed. Dropping a column, retyping one, and emptying a table on
+/// `TRUNCATE` discard data in the replica, and a deployment may prefer to keep
+/// it and reconcile by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SchemaFollowConfig {
+    /// Whether a column dropped in the source is dropped in the destination.
+    #[serde(default = "default_follow")]
+    pub drop_column: bool,
+    /// Whether a source column type change is applied to the destination.
+    ///
+    /// A destination that cannot promote the type in place rewrites the column,
+    /// so a value the new type cannot represent fails the change.
+    #[serde(default = "default_follow")]
+    pub change_type: bool,
+    /// Whether a source `TRUNCATE` empties the destination table.
+    #[serde(default = "default_follow")]
+    pub truncate: bool,
+}
+
+const fn default_follow() -> bool {
+    true
+}
+
+impl Default for SchemaFollowConfig {
+    fn default() -> Self {
+        Self { drop_column: true, change_type: true, truncate: true }
+    }
+}
+
 const fn default_ducklake_pool_size() -> u32 {
     DestinationConfig::DEFAULT_DUCKLAKE_POOL_SIZE
 }
@@ -65,6 +99,9 @@ pub enum DestinationConfig {
         /// Optional replica count for created tables. Doris defaults to three,
         /// which a cluster with fewer backends rejects.
         replication_num: Option<u16>,
+        /// Which source schema changes to follow.
+        #[serde(default)]
+        schema_follow: SchemaFollowConfig,
     },
     Ducklake {
         /// DuckLake catalog URL.
@@ -95,6 +132,9 @@ pub enum DestinationConfig {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
+        /// Which source schema changes to follow.
+        #[serde(default)]
+        schema_follow: SchemaFollowConfig,
     },
 }
 
@@ -133,6 +173,9 @@ pub enum DestinationConfigWithoutSecrets {
         /// Optional replica count for created tables. Doris defaults to three,
         /// which a cluster with fewer backends rejects.
         replication_num: Option<u16>,
+        /// Which source schema changes to follow.
+        #[serde(default)]
+        schema_follow: SchemaFollowConfig,
     },
     Ducklake {
         /// DuckLake data path.
@@ -157,6 +200,9 @@ pub enum DestinationConfigWithoutSecrets {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
+        /// Which source schema changes to follow.
+        #[serde(default)]
+        schema_follow: SchemaFollowConfig,
     },
 }
 
@@ -172,6 +218,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 database,
                 stream_load_timeout_secs,
                 replication_num,
+                schema_follow,
             } => DestinationConfigWithoutSecrets::Doris {
                 fe_http_url,
                 fe_mysql_host,
@@ -180,6 +227,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 database,
                 stream_load_timeout_secs,
                 replication_num,
+                schema_follow,
             },
             DestinationConfig::Ducklake {
                 catalog_url: _,
@@ -195,6 +243,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
+                schema_follow,
             } => DestinationConfigWithoutSecrets::Ducklake {
                 data_path,
                 pool_size,
@@ -206,6 +255,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
+                schema_follow,
             },
         }
     }
@@ -231,6 +281,7 @@ mod tests {
             maintenance_target_file_size: None,
             expire_snapshots_older_than: None,
             maintenance_mode: DuckLakeMaintenanceMode::Postgres,
+            schema_follow: SchemaFollowConfig::default(),
         };
 
         let without_secrets = DestinationConfigWithoutSecrets::from(config);
@@ -252,6 +303,7 @@ mod tests {
             database: "test_db".to_owned(),
             stream_load_timeout_secs: None,
             replication_num: None,
+            schema_follow: SchemaFollowConfig::default(),
         };
 
         let without_secrets = DestinationConfigWithoutSecrets::from(config);
