@@ -74,6 +74,7 @@ mod doris {
             password,
             database,
             stream_load_timeout_secs,
+            replication_num,
         } = &replicator_config.destination
         else {
             return Err(ReplicatorError::config(std::io::Error::other(
@@ -97,6 +98,7 @@ mod doris {
                 .unwrap_or(DorisConfig::DEFAULT_STREAM_LOAD_TIMEOUT_SECS),
             schema_change_timeout_secs: DorisConfig::DEFAULT_SCHEMA_CHANGE_TIMEOUT_SECS,
             pipeline_id,
+            replication_num: *replication_num,
         };
 
         let destination = DorisDestination::new(doris_config, store.clone()).await?;

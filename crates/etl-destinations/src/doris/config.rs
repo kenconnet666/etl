@@ -27,6 +27,9 @@ pub struct DorisConfig {
     pub schema_change_timeout_secs: u64,
     /// Pipeline ID used in Stream Load labels.
     pub pipeline_id: u64,
+    /// Replica count for created tables, or [`None`] to accept the Doris
+    /// default. A cluster with a single backend requires one.
+    pub replication_num: Option<u16>,
 }
 
 impl DorisConfig {
@@ -49,14 +52,16 @@ impl DorisConfig {
     }
 
     /// Returns the MySQL-protocol connection URL used for DDL.
+    ///
+    /// The target database is left out because the destination creates it on
+    /// first use, and every statement names its database explicitly.
     pub(super) fn mysql_url(&self) -> String {
         format!(
-            "mysql://{}:{}@{}:{}/{}",
+            "mysql://{}:{}@{}:{}",
             percent_encode(&self.user),
             percent_encode(&self.password),
             self.fe_mysql_host,
-            self.fe_mysql_port,
-            self.database
+            self.fe_mysql_port
         )
     }
 }
@@ -93,6 +98,7 @@ mod tests {
             stream_load_timeout_secs: DorisConfig::DEFAULT_STREAM_LOAD_TIMEOUT_SECS,
             schema_change_timeout_secs: DorisConfig::DEFAULT_SCHEMA_CHANGE_TIMEOUT_SECS,
             pipeline_id: 1,
+            replication_num: None,
         }
     }
 
@@ -103,9 +109,9 @@ mod tests {
     }
 
     #[test]
-    fn mysql_url_encodes_userinfo() {
+    fn mysql_url_encodes_userinfo_and_omits_the_database() {
         let mut config = test_config();
         config.password = "p@ss:word/1".to_owned();
-        assert_eq!(config.mysql_url(), "mysql://etl:p%40ss%3Aword%2F1@127.0.0.1:9030/analytics");
+        assert_eq!(config.mysql_url(), "mysql://etl:p%40ss%3Aword%2F1@127.0.0.1:9030");
     }
 }

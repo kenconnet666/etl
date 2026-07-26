@@ -111,16 +111,44 @@ log "building the replicator"
 cargo build --release -p etl-replicator --features doris --no-default-features
 [[ -x "$REPLICATOR_BIN" ]] || { echo "built binary not found at $REPLICATOR_BIN" >&2; exit 1; }
 
+log "writing the Doris configuration"
+# The shipped dev configuration targets DuckLake, and a destination is an
+# externally tagged enum, so this run gets its own configuration directory.
+CONFIG_DIR="$TARGET_DIR/e2e-doris-configuration"
+mkdir -p "$CONFIG_DIR"
+cat > "$CONFIG_DIR/base.yaml" <<YAML
+pipeline:
+  id: $PIPELINE_ID
+  publication_name: $PUBLICATION
+YAML
+cat > "$CONFIG_DIR/dev.yaml" <<YAML
+pipeline:
+  id: $PIPELINE_ID
+  publication_name: $PUBLICATION
+  pg_connection:
+    host: localhost
+    port: 15432
+    name: postgres
+    username: postgres
+    password: changeme
+    tls:
+      enabled: false
+      trusted_root_certs: ""
+
+destination:
+  doris:
+    fe_http_url: http://$DORIS_HOST:$DORIS_HTTP_PORT
+    fe_mysql_host: $DORIS_HOST
+    fe_mysql_port: $DORIS_MYSQL_PORT
+    user: $DORIS_USER
+    password: "$DORIS_PASSWORD"
+    database: $DORIS_DATABASE
+    replication_num: 1
+YAML
+
 log "starting the replicator"
 APP_ENVIRONMENT=dev \
-APP_PIPELINE__ID="$PIPELINE_ID" \
-APP_PIPELINE__PUBLICATION_NAME="$PUBLICATION" \
-APP_DESTINATION__DORIS__FE_HTTP_URL="http://$DORIS_HOST:$DORIS_HTTP_PORT" \
-APP_DESTINATION__DORIS__FE_MYSQL_HOST="$DORIS_HOST" \
-APP_DESTINATION__DORIS__FE_MYSQL_PORT="$DORIS_MYSQL_PORT" \
-APP_DESTINATION__DORIS__USER="$DORIS_USER" \
-APP_DESTINATION__DORIS__PASSWORD="$DORIS_PASSWORD" \
-APP_DESTINATION__DORIS__DATABASE="$DORIS_DATABASE" \
+APP_CONFIG_DIR="$CONFIG_DIR" \
 RUST_LOG="${RUST_LOG:-info}" \
   "$REPLICATOR_BIN" > "$LOG_FILE" 2>&1 &
 REPLICATOR_PID=$!

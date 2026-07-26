@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use etl::schema::{ColumnSchema, NumericModifiers, ReplicatedTableSchema, Type, numeric_modifiers};
 
-use crate::{doris::DorisTableName, sql::quote_double_identifier};
+use crate::doris::{DorisTableName, quote_identifier};
 
 /// Maximum `DECIMAL` precision supported by Doris.
 const DORIS_MAX_DECIMAL_PRECISION: i16 = 76;
@@ -83,53 +83,61 @@ pub(super) fn build_create_table_sql(
     table_name: &DorisTableName,
     schema: &ReplicatedTableSchema,
     layout: &DorisTableLayout,
+    replication_num: Option<u16>,
 ) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
 
     let mut col_defs = Vec::new();
 
     if layout.append_only {
         col_defs.push(format!(
             "    {} {SURROGATE_KEY_TYPE} NOT NULL",
-            quote_double_identifier(SURROGATE_KEY_COLUMN)
+            quote_identifier(SURROGATE_KEY_COLUMN)
         ));
     }
 
     for col in schema.column_schemas() {
         let is_key = layout.key_columns.contains(&col.name);
-        let col_name = quote_double_identifier(&col.name);
+        let col_name = quote_identifier(&col.name);
         let col_type = postgres_type_to_doris_sql(&col.typ, col.modifier, is_key);
         let null_clause = if is_key { " NOT NULL" } else { " NULL" };
         col_defs.push(format!("    {col_name} {col_type}{null_clause}"));
     }
 
-    let key_list: Vec<String> =
-        layout.key_columns.iter().map(|k| quote_double_identifier(k)).collect();
+    let key_list: Vec<String> = layout.key_columns.iter().map(|k| quote_identifier(k)).collect();
     let key_clause = key_list.join(", ");
     let columns_str = col_defs.join(",\n");
+
+    let mut properties = vec!["\"enable_unique_key_merge_on_write\" = \"true\"".to_owned()];
+    // Doris defaults to three replicas, which a cluster with fewer backends
+    // rejects at create time.
+    if let Some(replication_num) = replication_num {
+        properties.push(format!("\"replication_num\" = \"{replication_num}\""));
+    }
+    let properties_str = properties.join(", ");
 
     format!(
         "CREATE TABLE IF NOT EXISTS {db}.{tbl} (\n{columns_str}\n)\nUNIQUE \
          KEY({key_clause})\nDISTRIBUTED BY HASH({key_clause}) BUCKETS AUTO\nPROPERTIES \
-         (\"enable_unique_key_merge_on_write\" = \"true\")"
+         ({properties_str})"
     )
 }
 
 /// Generates an `ALTER TABLE ... ADD COLUMN` statement.
 pub(super) fn build_add_column_sql(table_name: &DorisTableName, col: &ColumnSchema) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
-    let col_name = quote_double_identifier(&col.name);
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
+    let col_name = quote_identifier(&col.name);
     let col_type = postgres_type_to_doris_sql(&col.typ, col.modifier, false);
     format!("ALTER TABLE {db}.{tbl} ADD COLUMN {col_name} {col_type} NULL")
 }
 
 /// Generates an `ALTER TABLE ... DROP COLUMN` statement.
 pub(super) fn build_drop_column_sql(table_name: &DorisTableName, col_name: &str) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
-    let col = quote_double_identifier(col_name);
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
+    let col = quote_identifier(col_name);
     format!("ALTER TABLE {db}.{tbl} DROP COLUMN {col}")
 }
 
@@ -139,10 +147,10 @@ pub(super) fn build_rename_column_sql(
     old_name: &str,
     new_name: &str,
 ) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
-    let old = quote_double_identifier(old_name);
-    let new = quote_double_identifier(new_name);
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
+    let old = quote_identifier(old_name);
+    let new = quote_identifier(new_name);
     format!("ALTER TABLE {db}.{tbl} RENAME COLUMN {old} {new}")
 }
 
@@ -151,32 +159,32 @@ pub(super) fn build_modify_column_type_sql(
     table_name: &DorisTableName,
     col: &ColumnSchema,
 ) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
-    let col_name = quote_double_identifier(&col.name);
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
+    let col_name = quote_identifier(&col.name);
     let col_type = postgres_type_to_doris_sql(&col.typ, col.modifier, false);
     format!("ALTER TABLE {db}.{tbl} MODIFY COLUMN {col_name} {col_type} NULL")
 }
 
 /// Generates an `ALTER TABLE ... RENAME` statement.
 pub(super) fn build_rename_table_sql(table_name: &DorisTableName, new_table: &str) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
-    let new = quote_double_identifier(new_table);
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
+    let new = quote_identifier(new_table);
     format!("ALTER TABLE {db}.{tbl} RENAME {new}")
 }
 
 /// Generates a `DROP TABLE IF EXISTS` statement.
 pub(super) fn build_drop_table_sql(table_name: &DorisTableName) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
     format!("DROP TABLE IF EXISTS {db}.{tbl}")
 }
 
 /// Generates a `TRUNCATE TABLE` statement.
 pub(super) fn build_truncate_table_sql(table_name: &DorisTableName) -> String {
-    let db = quote_double_identifier(table_name.database());
-    let tbl = quote_double_identifier(table_name.table());
+    let db = quote_identifier(table_name.database());
+    let tbl = quote_identifier(table_name.table());
     format!("TRUNCATE TABLE {db}.{tbl}")
 }
 
@@ -284,11 +292,11 @@ mod tests {
         let schema = schema_with_pk();
         let layout = DorisTableLayout::from_schema(&schema);
         let table_name = DorisTableName::new("db", "public_users");
-        let sql = build_create_table_sql(&table_name, &schema, &layout);
-        assert!(sql.contains("UNIQUE KEY(\"id\")"));
-        assert!(sql.contains("DISTRIBUTED BY HASH(\"id\") BUCKETS AUTO"));
-        assert!(sql.contains("\"id\" int NOT NULL"));
-        assert!(sql.contains("\"name\" varchar(65533) NULL"));
+        let sql = build_create_table_sql(&table_name, &schema, &layout, None);
+        assert!(sql.contains("UNIQUE KEY(`id`)"));
+        assert!(sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS AUTO"));
+        assert!(sql.contains("`id` int NOT NULL"));
+        assert!(sql.contains("`name` varchar(65533) NULL"));
         assert!(sql.contains("enable_unique_key_merge_on_write"));
     }
 
@@ -297,9 +305,9 @@ mod tests {
         let schema = schema_no_pk();
         let layout = DorisTableLayout::from_schema(&schema);
         let table_name = DorisTableName::new("db", "public_events");
-        let sql = build_create_table_sql(&table_name, &schema, &layout);
+        let sql = build_create_table_sql(&table_name, &schema, &layout, None);
         assert!(sql.contains(SURROGATE_KEY_COLUMN));
-        assert!(sql.contains("UNIQUE KEY(\"_etl_row_id\")"));
+        assert!(sql.contains("UNIQUE KEY(`_etl_row_id`)"));
     }
 
     #[test]

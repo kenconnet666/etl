@@ -153,7 +153,12 @@ where
             .store_destination_table_metadata(replicated_table_schema.id(), metadata.clone())
             .await?;
 
-        let sql = build_create_table_sql(table_name, replicated_table_schema, &layout);
+        let sql = build_create_table_sql(
+            table_name,
+            replicated_table_schema,
+            &layout,
+            self.config.replication_num,
+        );
         {
             let _ddl_permit = self.ddl_lock.lock().await;
             self.ddl.execute(&sql, "Doris create table failed").await?;
@@ -264,7 +269,7 @@ where
             }
 
             let sql = build_add_column_sql(table_name, column_schema);
-            self.ddl.execute_async_schema_change(&sql, table_name.table()).await?;
+            self.ddl.execute_async_schema_change(&sql, table_name).await?;
         }
 
         for column_schema in &diff.columns_to_remove {
@@ -283,7 +288,7 @@ where
             }
 
             let sql = build_drop_column_sql(table_name, &column_schema.name);
-            self.ddl.execute_async_schema_change(&sql, table_name.table()).await?;
+            self.ddl.execute_async_schema_change(&sql, table_name).await?;
         }
 
         for change in &diff.columns_to_change {
@@ -295,7 +300,7 @@ where
                         }
 
                         let sql = build_rename_column_sql(table_name, old_name, new_name);
-                        self.ddl.execute_async_schema_change(&sql, table_name.table()).await?;
+                        self.ddl.execute_async_schema_change(&sql, table_name).await?;
                     }
                     ColumnModification::Type { .. } => {
                         if layout.key_columns.contains(&change.new_column.name) {
@@ -308,7 +313,7 @@ where
                         }
 
                         let sql = build_modify_column_type_sql(table_name, &change.new_column);
-                        self.ddl.execute_async_schema_change(&sql, table_name.table()).await?;
+                        self.ddl.execute_async_schema_change(&sql, table_name).await?;
                     }
                     // Doris value columns stay nullable so a relaxed source keeps
                     // loading, and the replica mirrors source data rather than

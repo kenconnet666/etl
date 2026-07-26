@@ -60,6 +60,18 @@ pub(crate) fn table_name_to_doris_table_name(
     DorisTableName::new(database, format!("{}_{}", table_name.schema, table_name.name))
 }
 
+/// Quotes a Doris identifier using backticks.
+///
+/// Doris follows MySQL here and rejects double-quoted identifiers.
+pub(super) fn quote_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
+/// Quotes a Doris string literal.
+pub(super) fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

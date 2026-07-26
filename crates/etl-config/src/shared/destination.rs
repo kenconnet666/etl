@@ -62,6 +62,9 @@ pub enum DestinationConfig {
         database: String,
         /// Optional Stream Load timeout in seconds.
         stream_load_timeout_secs: Option<u64>,
+        /// Optional replica count for created tables. Doris defaults to three,
+        /// which a cluster with fewer backends rejects.
+        replication_num: Option<u16>,
     },
     Ducklake {
         /// DuckLake catalog URL.
@@ -127,6 +130,9 @@ pub enum DestinationConfigWithoutSecrets {
         database: String,
         /// Optional Stream Load timeout in seconds.
         stream_load_timeout_secs: Option<u64>,
+        /// Optional replica count for created tables. Doris defaults to three,
+        /// which a cluster with fewer backends rejects.
+        replication_num: Option<u16>,
     },
     Ducklake {
         /// DuckLake data path.
@@ -165,6 +171,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 password: _,
                 database,
                 stream_load_timeout_secs,
+                replication_num,
             } => DestinationConfigWithoutSecrets::Doris {
                 fe_http_url,
                 fe_mysql_host,
@@ -172,6 +179,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 user,
                 database,
                 stream_load_timeout_secs,
+                replication_num,
             },
             DestinationConfig::Ducklake {
                 catalog_url: _,
@@ -243,6 +251,7 @@ mod tests {
             password: "secret123".to_owned().into(),
             database: "test_db".to_owned(),
             stream_load_timeout_secs: None,
+            replication_num: None,
         };
 
         let without_secrets = DestinationConfigWithoutSecrets::from(config);

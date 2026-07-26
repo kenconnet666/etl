@@ -4,7 +4,7 @@ mod destinations;
 #[cfg(feature = "any-destination")]
 mod pipeline;
 
-#[cfg(all(feature = "any-destination", not(feature = "ducklake")))]
+#[cfg(all(feature = "any-destination", not(any(feature = "doris", feature = "ducklake"))))]
 compile_error!("`any-destination` is internal; enable a concrete destination feature instead.");
 
 use etl::{pipeline::PipelineId, store::PostgresStore};
