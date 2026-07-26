@@ -3622,7 +3622,7 @@ mod tests {
             ducklake_load_sql(),
             quote_literal(&format!("ducklake:{catalog_attach_target}")),
             quote_identifier(LAKE_CATALOG),
-            quote_literal(data.as_str()),
+            quote_literal(validate_data_path(data).expect("unsupported data path")),
         ))
         .expect("failed to attach DuckLake catalog");
         conn

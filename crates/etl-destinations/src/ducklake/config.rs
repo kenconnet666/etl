@@ -752,6 +752,11 @@ fn build_setup_plan_with_strategy(
 
 #[cfg(test)]
 mod tests {
+
+    /// Returns the data path string the setup SQL is expected to carry.
+    fn expected_data_path(data_url: &Url) -> &str {
+        if data_url.scheme() == "file" { data_url.path() } else { data_url.as_str() }
+    }
     use std::fs;
 
     use tempfile::TempDir;
@@ -1100,7 +1105,9 @@ mod tests {
             PARQUET_VERSION_OPTION_VALUE,
         )));
         assert!(sql.contains(&quote_literal(&format!("ducklake:{}", catalog_url.as_str()))));
-        assert!(sql.contains(&format!("DATA_PATH {}", quote_literal(data_url.as_str()))));
+        assert!(
+            sql.contains(&format!("DATA_PATH {}", quote_literal(expected_data_path(&data_url))))
+        );
         assert!(sql.contains(&format!(
             "DATA_INLINING_ROW_LIMIT {}",
             crate::ducklake::ATTACH_DATA_INLINING_ROW_LIMIT
@@ -1184,7 +1191,9 @@ mod tests {
         )));
         assert!(!sql.contains("ducklake:postgres://"));
         assert!(sql.contains("ducklake:postgres:"));
-        assert!(sql.contains(&format!("DATA_PATH {}", quote_literal(data_url.as_str()))));
+        assert!(
+            sql.contains(&format!("DATA_PATH {}", quote_literal(expected_data_path(&data_url))))
+        );
         assert!(sql.contains(&format!(
             "DATA_INLINING_ROW_LIMIT {}",
             crate::ducklake::ATTACH_DATA_INLINING_ROW_LIMIT
@@ -1229,7 +1238,9 @@ mod tests {
             PARQUET_VERSION_OPTION_VALUE,
         )));
         assert!(!sql.contains("ducklake:postgres://"));
-        assert!(sql.contains(&format!("DATA_PATH {}", quote_literal(data_url.as_str()))));
+        assert!(
+            sql.contains(&format!("DATA_PATH {}", quote_literal(expected_data_path(&data_url))))
+        );
         assert!(sql.contains(&format!(
             "DATA_INLINING_ROW_LIMIT {}",
             crate::ducklake::ATTACH_DATA_INLINING_ROW_LIMIT

@@ -1856,6 +1856,15 @@ impl ReusableStagingTable {
         }
     }
 
+    /// Returns whether rows have to pass through staging.
+    ///
+    /// A `VARIANT` column is the only case: the writer can only carry the
+    /// document as text, and turning that text into a `VARIANT` needs a cast
+    /// that neither the appender nor a plain `VALUES` list can express.
+    fn needs_staging(&self) -> bool {
+        !self.variant_column_names.is_empty()
+    }
+
     /// Loads one prepared row set into staging and applies it to the target
     /// table.
     fn stage_and_insert(
@@ -2172,6 +2181,11 @@ fn apply_table_mutation(
 }
 
 /// Applies one upsert batch inside an open DuckLake transaction.
+///
+/// An upsert segment is a pure insert, because the matching deletes are their
+/// own segment, so rows go straight into the DuckLake table. Staging is only
+/// needed when a column needs a cast the writer cannot express, which today
+/// means a `VARIANT` column.
 fn apply_upsert_mutation(
     conn: &duckdb::Connection,
     prepared_rows: &PreparedRows,
@@ -2183,7 +2197,107 @@ fn apply_upsert_mutation(
         return Ok(());
     }
 
-    reusable_staging_table.stage_and_insert(conn, prepared_rows)
+    if reusable_staging_table.needs_staging() {
+        return reusable_staging_table.stage_and_insert(conn, prepared_rows);
+    }
+
+    insert_rows_directly(
+        conn,
+        &reusable_staging_table.table_name,
+        &reusable_staging_table.insert_column_names,
+        prepared_rows,
+    )
+}
+
+/// Writes prepared rows straight into a DuckLake table.
+fn insert_rows_directly(
+    conn: &duckdb::Connection,
+    table_name: &DuckLakeTableName,
+    column_names: &[String],
+    prepared_rows: &PreparedRows,
+) -> EtlResult<()> {
+    match prepared_rows {
+        PreparedRows::SqlLiterals(rows) => {
+            let target_table = qualified_lake_table_name(table_name);
+            let column_list = quoted_column_list(column_names);
+            let values = rows.join(", ");
+            let sql = format!("insert into {target_table} ({column_list}) values {values};");
+            conn.execute_batch(&sql).map_err(|error| {
+                tracing::error!(error = %DuckDbSensitiveQueryError, "error direct INSERT");
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake direct INSERT failed",
+                    format!("table={table_name}"),
+                    source: error
+                )
+            })?;
+            Ok(())
+        }
+        PreparedRows::Appender(all_values) => {
+            let mut appender = lake_appender(conn, table_name)?;
+            for values in all_values {
+                appender.append_row(duckdb::appender_params_from_iter(values)).map_err(
+                    |error| {
+                        tracing::error!(error = %error, "error direct append row");
+                        etl_error!(
+                            ErrorKind::DestinationQueryFailed,
+                            "DuckLake direct append_row failed",
+                            format!("table={table_name}"),
+                            source: error
+                        )
+                    },
+                )?;
+            }
+            flush_appender(appender, table_name)
+        }
+        PreparedRows::ArrowRecordBatch(record_batch) => {
+            let mut appender = lake_appender(conn, table_name)?;
+            appender.append_record_batch(record_batch.clone()).map_err(|error| {
+                tracing::error!(error = %error, "error direct append record batch");
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake direct append_record_batch failed",
+                    format!("table={table_name}"),
+                    source: error
+                )
+            })?;
+            flush_appender(appender, table_name)
+        }
+    }
+}
+
+/// Opens an appender on a DuckLake table in the attached lake catalog.
+fn lake_appender<'a>(
+    conn: &'a duckdb::Connection,
+    table_name: &DuckLakeTableName,
+) -> EtlResult<duckdb::Appender<'a>> {
+    conn.appender_to_catalog_and_db(table_name.table(), LAKE_CATALOG, table_name.schema()).map_err(
+        |error| {
+            tracing::error!(error = %error, "error lake appender");
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake appender creation failed",
+                format!("table={table_name}"),
+                source: error
+            )
+        },
+    )
+}
+
+/// Flushes an appender and maps its failure.
+fn flush_appender(
+    mut appender: duckdb::Appender<'_>,
+    table_name: &DuckLakeTableName,
+) -> EtlResult<()> {
+    appender.flush().map_err(|error| {
+        tracing::error!(error = %error, "error direct appender flush");
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake appender flush failed",
+            format!("table={table_name}"),
+            source: error
+        )
+    })
 }
 
 /// Applies one delete batch inside an open DuckLake transaction.
