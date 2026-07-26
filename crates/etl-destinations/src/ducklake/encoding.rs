@@ -612,6 +612,11 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
+/// Converts the cells of a key row into appender values.
+pub(super) fn prepare_key_values(key_row: &TableRow) -> Vec<Value> {
+    key_row.values().iter().map(|cell| cell_to_value(cell_to_owned(cell))).collect()
+}
+
 /// Converts a [`Cell`] to a [`duckdb::types::Value`] for use with parameterized
 /// INSERT statements.
 fn cell_to_value(cell: Cell) -> Value {
