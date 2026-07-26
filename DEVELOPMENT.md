@@ -235,11 +235,25 @@ The fixed cost is the batch fill window, connection setup, and the benchmark's
 own polling granularity. It dominates at 100,000 rows and fades at 1,000,000,
 which is why a figure is only comparable against another at the same row count.
 
-Inside a batch the write itself is fast: the `upsert` stage averages 87 ms for
-about 15,000 rows, roughly 6 microseconds per row. A DuckLake commit costs about
-28 ms for a streaming batch, and the batch count multiplies that, but raising
-`max_bytes` from 8 MB to 128 MB changed nothing measurable, so the batch count is
-not what bounds throughput at this scale.
+**The destination is no longer the bottleneck.** Over the 1,000,000-row run the
+`upsert` stage wrote 3,000,039 rows across 210 calls at 83 ms each, about 5.8
+microseconds per row, and `delete` matched 2,000,012 keys across 137 calls at 78
+ms each, about 5.2 microseconds per key. That is roughly 170,000 rows/s of write
+capacity against measured end-to-end rates of 29,000 to 49,000. Two waits confirm
+it: `blocking_slot_wait` totalled 2.8 ms across 531 acquisitions and
+`pool_checkout_wait` 0.59 s, so the destination never queues for a resource — it
+waits for events to arrive.
+
+The batch size follows from that. Batches averaged 14,000 rows, which is the
+decode rate multiplied by the 500 ms fill window, and raising `max_bytes` from
+8 MB to 128 MB changed nothing measurable. A DuckLake commit costs about 28 ms and
+there were 227 of them, 6.4 s in total, so the commit count is real but small
+next to the 118 s the streaming scenarios took.
+
+Further throughput therefore has to come from decode and transport in `etl`, not
+from the destination. For reference, the implementation this fork was compared
+against measures its own protocol ceiling at 153,000 to 163,000 rows/s while its
+full chain reaches 34,542, so it does not saturate decode either.
 
 **The initial copy carries about 18 seconds that is still unattributed.** Its own
 table sync takes 4.4 s — the state log goes `init` to `data_sync` to `sync_done`
@@ -258,16 +272,17 @@ carries JSON as text, so `Utf8` would match.
 
 ### Next steps, in order
 
-1. **Attribute the initial copy's fixed cost.** Time the replicator from process
-   start to the first copy batch, and time the source-side snapshot and `COPY`
-   separately from the destination write. Do not guess: every earlier guess about
-   this figure was wrong, including three in a row during the last round.
-2. **Look at the commit stage**, which is roughly 5x the reference
-   implementation's, and widen the Arrow column coverage so a JSON or UUID column
-   stops disabling it for a whole table.
-3. **Only then consider structural changes.** The insert and delete paths are
-   already near the destination's absorption rate, so further work there needs a
-   measurement showing which stage still dominates.
+1. **Profile decode and transport in `etl`.** That is where the remaining
+   headroom is: the destination has roughly a 4x margin over the current
+   end-to-end rate and spends its time waiting for events. Add stage timings
+   around event decoding and the apply loop before changing anything, the same
+   way the destination timings turned three wrong guesses into one correct fix.
+2. **Attribute the initial copy's fixed cost**, which is about 18 s regardless of
+   row count. It amortises at 1,000,000 rows but dominates smaller tables. See
+   the list above for what has already been ruled out.
+3. **Widen the Arrow column coverage** so a JSON or UUID column stops disabling
+   it for a whole table, and look at the commit stage if a profile shows it
+   matters.
 
 ### Known open issues
 
