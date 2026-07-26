@@ -31,7 +31,10 @@ fn postgres_scalar_type_to_ducklake_sql(typ: &Type, modifier: i32) -> Cow<'stati
         &Type::TIMESTAMP => "timestamp".into(),
         &Type::TIMESTAMPTZ => "timestamptz".into(),
         &Type::UUID => "uuid".into(),
-        &Type::JSON | &Type::JSONB => "json".into(),
+        // A VARIANT shreds its subfields into separate Parquet columns with
+        // statistics, so a path filter can prune files and a query does not have
+        // to parse JSON at runtime.
+        &Type::JSON | &Type::JSONB => "variant".into(),
         &Type::OID => "ubigint".into(),
         &Type::BYTEA => "blob".into(),
         _ => FALLBACK_TYPE.into(),
@@ -52,7 +55,11 @@ fn postgres_array_type_to_ducklake_sql(typ: &Type, _modifier: i32) -> &'static s
         &Type::TIMESTAMP_ARRAY => "timestamp[]",
         &Type::TIMESTAMPTZ_ARRAY => "timestamptz[]",
         &Type::UUID_ARRAY => "uuid[]",
-        &Type::JSON_ARRAY | &Type::JSONB_ARRAY => "json[]",
+        // Not `json[]`: reading an inlined `json[]` value crashes the DuckLake
+        // extension, because a non-DuckDB catalog stores a list inline as text
+        // and casting it back fails. Not `variant[]` either, because the Parquet
+        // writer rejects a VARIANT that is not a root column.
+        &Type::JSON_ARRAY | &Type::JSONB_ARRAY => "varchar[]",
         &Type::OID_ARRAY => "ubigint[]",
         &Type::BYTEA_ARRAY => "blob[]",
         _ => "varchar[]",
@@ -429,8 +436,8 @@ mod tests {
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::TIMESTAMPTZ, -1), "timestamptz");
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::INTERVAL, -1), "varchar");
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::UUID, -1), "uuid");
-        assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::JSON, -1), "json");
-        assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::JSONB, -1), "json");
+        assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::JSON, -1), "variant");
+        assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::JSONB, -1), "variant");
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::OID, -1), "ubigint");
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::BYTEA, -1), "blob");
     }

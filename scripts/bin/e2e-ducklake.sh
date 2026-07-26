@@ -118,12 +118,13 @@ source_sql "create table public.\"$TABLE\" (
   id bigint primary key,
   customer text not null,
   quantity integer not null,
-  amount numeric(10, 2)
+  amount numeric(10, 2),
+  payload jsonb
 )"
 source_sql "create publication $PUBLICATION for table public.\"$TABLE\""
 source_sql "insert into public.\"$TABLE\" values
-  (1, 'alice', 2, 19.99),
-  (2, 'bob', 1, 5.50)"
+  (1, 'alice', 2, 19.99, '{\"tier\": \"gold\", \"limits\": {\"daily\": 50}}'),
+  (2, 'bob', 1, 5.50, null)"
 
 log "resetting replication state"
 source_sql "drop schema if exists etl cascade"
@@ -200,7 +201,7 @@ expect_lake "initial copy landed two rows" \
   "select count(*) from lake.public.\"$TABLE\";" "2"
 
 log "streaming an insert, an update, and a delete"
-source_sql "insert into public.\"$TABLE\" values (3, 'carol', 4, 41.00)"
+source_sql "insert into public.\"$TABLE\" values (3, 'carol', 4, 41.00, null)"
 source_sql "update public.\"$TABLE\" set quantity = 7, amount = 70.70 where id = 1"
 source_sql "delete from public.\"$TABLE\" where id = 2"
 
@@ -209,11 +210,23 @@ expect_lake "the replica reflects the current source state" \
    from lake.public.\"$TABLE\";" \
   "1:alice:7,3:carol:4"
 
+expect_lake "a json document lands in a variant column" \
+  "select cast(payload['tier'] as varchar) from lake.public.\"$TABLE\" where id = 1;" \
+  "gold"
+expect_lake "a nested json path is queryable" \
+  "select cast(payload['limits']['daily'] as integer)
+   from lake.public.\"$TABLE\" where id = 1;" \
+  "50"
+expect_lake "the destination column type is variant" \
+  "select data_type from information_schema.columns
+   where table_catalog = 'lake' and table_schema = 'public'
+     and table_name = '$TABLE' and column_name = 'payload';" "VARIANT"
+
 log "following DDL: add a column, rename a column, widen a type"
 source_sql "alter table public.\"$TABLE\" add column channel text"
 source_sql "alter table public.\"$TABLE\" rename column customer to buyer"
 source_sql "alter table public.\"$TABLE\" alter column quantity type bigint"
-source_sql "insert into public.\"$TABLE\" values (4, 'dave', 5000000000, 12.00, 'web')"
+source_sql "insert into public.\"$TABLE\" values (4, 'dave', 5000000000, 12.00, null, 'web')"
 
 expect_lake "the added column replicated" \
   "select channel from lake.public.\"$TABLE\" where id = 4;" "web"
@@ -228,7 +241,7 @@ expect_lake "the destination column type followed the source" \
 
 log "following DDL: rename the table"
 source_sql "alter table public.\"$TABLE\" rename to \"${TABLE}_renamed\""
-source_sql "insert into public.\"${TABLE}_renamed\" values (5, 'erin', 6, 6.00, 'app')"
+source_sql "insert into public.\"${TABLE}_renamed\" values (5, 'erin', 6, 6.00, null, 'app')"
 
 expect_lake "the renamed table keeps its history and accepts new rows" \
   "select count(*) from lake.public.\"${TABLE}_renamed\";" "4"
@@ -240,7 +253,7 @@ expect_lake "the truncate replicated" \
   "select count(*) from lake.public.\"${TABLE}_renamed\";" "0"
 
 log "recovering from destination divergence with a resync"
-source_sql "insert into public.\"${TABLE}_renamed\" values (6, 'frank', 8, 8.00, 'store')"
+source_sql "insert into public.\"${TABLE}_renamed\" values (6, 'frank', 8, 8.00, null, 'store')"
 expect_lake "the source row replicated before the resync" \
   "select count(*) from lake.public.\"${TABLE}_renamed\";" "1"
 
@@ -249,7 +262,7 @@ expect_lake "the source row replicated before the resync" \
 stop_replicator
 lake_write "delete from lake.public.\"${TABLE}_renamed\" where id = 6;
             insert into lake.public.\"${TABLE}_renamed\"
-              values (99, 'stale', 1, 1.00, 'stale');"
+              values (99, 'stale', 1, 1.00, null, 'stale');"
 
 TABLE_OID="$(source_query "select 'public.\"${TABLE}_renamed\"'::regclass::oid")"
 echo "resetting table oid $TABLE_OID"

@@ -63,8 +63,11 @@ fn postgres_scalar_type_to_doris_sql(typ: &Type, modifier: i32, is_key: bool) ->
         &Type::DATE => "date".into(),
         &Type::TIMESTAMP | &Type::TIMESTAMPTZ => "datetime(6)".into(),
         &Type::UUID => "varchar(36)".into(),
-        // Doris has no JSON key type, and a key needs a bounded width.
-        &Type::JSON | &Type::JSONB if !is_key => "json".into(),
+        // A VARIANT subcolumnizes frequent JSON paths, which the Doris
+        // benchmarks report as roughly 65% less storage and 8x faster queries
+        // than the row-oriented JSON type. It cannot be a key or sort key, so a
+        // key column falls back to bounded text.
+        &Type::JSON | &Type::JSONB if !is_key => "variant".into(),
         _ => fallback,
     }
 }
@@ -321,8 +324,8 @@ mod tests {
         assert_eq!(postgres_type_to_doris_sql(&Type::DATE, -1, false), "date");
         assert_eq!(postgres_type_to_doris_sql(&Type::TIMESTAMP, -1, false), "datetime(6)");
         assert_eq!(postgres_type_to_doris_sql(&Type::TIMESTAMPTZ, -1, false), "datetime(6)");
-        assert_eq!(postgres_type_to_doris_sql(&Type::JSON, -1, false), "json");
-        assert_eq!(postgres_type_to_doris_sql(&Type::JSONB, -1, false), "json");
+        assert_eq!(postgres_type_to_doris_sql(&Type::JSON, -1, false), "variant");
+        assert_eq!(postgres_type_to_doris_sql(&Type::JSONB, -1, false), "variant");
         assert_eq!(postgres_type_to_doris_sql(&Type::UUID, -1, false), "varchar(36)");
         assert_eq!(postgres_type_to_doris_sql(&Type::OID, -1, false), "bigint");
     }

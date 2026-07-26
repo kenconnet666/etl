@@ -98,12 +98,14 @@ source_sql "create table public.\"$TABLE\" (
   quantity integer not null,
   amount numeric(10, 2),
   tags text[],
-  scores numeric(6, 2)[]
+  scores numeric(6, 2)[],
+  payload jsonb
 )"
 source_sql "create publication $PUBLICATION for table public.\"$TABLE\""
 source_sql "insert into public.\"$TABLE\" values
-  (1, 'alice', 2, 19.99, array['vip','eu'], array[1.50, 2.25]),
-  (2, 'bob', 1, 5.50, null, null)"
+  (1, 'alice', 2, 19.99, array['vip','eu'], array[1.50, 2.25],
+   '{\"tier\": \"gold\", \"limits\": {\"daily\": 50}}'),
+  (2, 'bob', 1, 5.50, null, null, null)"
 
 log "resetting replication and destination state"
 source_sql "drop schema if exists etl cascade"
@@ -160,7 +162,7 @@ expect_doris "initial copy landed two rows" \
   "select count(*) from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\`" "2" 60
 
 log "streaming an insert, an update, and a delete"
-source_sql "insert into public.\"$TABLE\" values (3, 'carol', 4, 41.00)"
+source_sql "insert into public.\"$TABLE\" values (3, 'carol', 4, 41.00, null, null, null)"
 source_sql "update public.\"$TABLE\" set quantity = 7 where id = 1"
 source_sql "delete from public.\"$TABLE\" where id = 2"
 
@@ -178,6 +180,17 @@ expect_doris "the array column type is native" \
    where table_schema = '$DORIS_DATABASE' and table_name = '$DORIS_TABLE'
      and column_name = 'tags'" "array"
 
+expect_doris "a json document lands in a variant column" \
+  "select cast(payload['tier'] as string) from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\`
+   where id = 1" "gold"
+expect_doris "a nested json path is queryable" \
+  "select cast(payload['limits']['daily'] as int)
+   from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\` where id = 1" "50"
+expect_doris "the json column type is variant" \
+  "select lower(data_type) from information_schema.columns
+   where table_schema = '$DORIS_DATABASE' and table_name = '$DORIS_TABLE'
+     and column_name = 'payload'" "variant"
+
 log "changing a primary key value"
 source_sql "update public.\"$TABLE\" set id = 30 where id = 3"
 
@@ -192,7 +205,7 @@ log "following DDL: add a column and widen a type"
 source_sql "alter table public.\"$TABLE\" add column channel text"
 source_sql "alter table public.\"$TABLE\" alter column quantity type bigint"
 source_sql "insert into public.\"$TABLE\" values
-  (4, 'dave', 5000000000, 12.00, null, null, 'web')"
+  (4, 'dave', 5000000000, 12.00, null, null, null, 'web')"
 
 expect_doris "the added column replicated" \
   "select channel from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\` where id = 4" "web"

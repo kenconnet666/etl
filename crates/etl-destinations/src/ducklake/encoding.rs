@@ -374,8 +374,14 @@ pub(super) fn cell_to_sql_literal_ref(cell: &Cell) -> String {
 }
 
 /// Returns whether a cell must bypass the DuckDB appender path.
+///
+/// A JSON cell targets a `VARIANT` column, and only the two-step
+/// `VARCHAR -> JSON -> VARIANT` cast parses the document; handing DuckDB a
+/// plain string produces a VARIANT holding that string, whose subpaths all read
+/// back as null. The appender cannot express that cast, so the row goes through
+/// SQL.
 fn cell_requires_sql_literals(cell: &Cell) -> bool {
-    matches!(cell, Cell::Array(_))
+    matches!(cell, Cell::Array(_) | Cell::Json(_))
 }
 
 /// Serializes a row into a SQL `VALUES (...)` tuple.
@@ -412,7 +418,9 @@ fn cell_to_sql_literal(cell: Cell) -> String {
             format!("TIMESTAMPTZ '{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f%:z"))
         }
         Cell::Uuid(u) => format!("CAST({} AS UUID)", quote_literal(&u.to_string())),
-        Cell::Json(j) => format!("CAST({} AS JSON)", quote_literal(&j.to_string())),
+        Cell::Json(j) => {
+            format!("CAST(CAST({} AS JSON) AS VARIANT)", quote_literal(&j.to_string()))
+        }
         Cell::Bytes(b) => format!("from_hex('{}')", encode_hex(&b)),
         Cell::Array(arr) => array_cell_to_sql_literal(arr),
     }
@@ -561,14 +569,10 @@ fn array_cell_to_sql_literal(arr: ArrayCell) -> String {
                 )
             })
             .collect(),
+        // The column is `varchar[]`, so each document is stored as its text.
         ArrayCell::Json(v) => v
             .into_iter()
-            .map(|o| {
-                o.map_or_else(
-                    || "NULL".to_owned(),
-                    |value| format!("CAST({} AS JSON)", quote_literal(&value.to_string())),
-                )
-            })
+            .map(|o| o.map_or_else(|| "NULL".to_owned(), |value| quote_literal(&value.to_string())))
             .collect(),
         ArrayCell::Bytes(v) => v
             .into_iter()
@@ -763,7 +767,7 @@ mod tests {
                 Some(serde_json::json!({"a": 1})),
                 None,
             ])),
-            "[CAST('{\"a\":1}' AS JSON), NULL]"
+            "['{\"a\":1}', NULL]"
         );
     }
 
@@ -859,12 +863,16 @@ mod tests {
 
         let prepared = prepare_copy_rows(&schema, rows).unwrap();
 
+        // A JSON document targets a VARIANT column, which needs an explicit
+        // two-step cast that only the SQL path can express.
         match prepared {
-            PreparedRows::Appender(rows) => {
+            PreparedRows::SqlLiterals(rows) => {
                 assert_eq!(rows.len(), 1);
+                assert!(rows[0].contains("CAST(CAST("));
+                assert!(rows[0].contains("AS VARIANT)"));
             }
-            PreparedRows::SqlLiterals(_) | PreparedRows::ArrowRecordBatch(_) => {
-                panic!("expected row appender fallback")
+            PreparedRows::Appender(_) | PreparedRows::ArrowRecordBatch(_) => {
+                panic!("expected sql literal fallback")
             }
         }
     }
