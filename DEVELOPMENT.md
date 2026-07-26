@@ -252,6 +252,34 @@ for the reference implementation, cause not yet investigated; and
 sends a whole table down the row-by-row appender path. Staging already carries
 JSON as text, so `Utf8` would match.
 
+### Next steps, in order
+
+1. **Replace the delete predicate list with a staging join.** Write the keys into
+   a staging table and match with
+   `DELETE FROM t WHERE EXISTS (SELECT 1 FROM stg s WHERE t.k = s.k)`. This is the
+   largest known win: it should pull the delete path's 0.42 ms per row toward the
+   insert path's 0.031 ms, which lands on the warm update, warm delete, and
+   interleaved scenarios at once. `SQL_DELETE_BATCH_SIZE` becomes irrelevant.
+2. **Extend the stage timings to the table sync worker**, then attack the initial
+   copy's 17 seconds of fixed cost. Do not guess at it first; the current
+   timings stop at the batch boundary, and every earlier guess about this code
+   turned out wrong.
+3. **Look at the commit stage** once the two above are done, and widen the Arrow
+   column coverage so a JSON or UUID column stops disabling it for a whole table.
+
+### Known open issues
+
+- `cargo clippy -p etl-destinations --features ducklake --no-default-features`
+  fails with `cannot find signal in tokio`. It predates this work: the
+  destination uses `tokio::signal` but that feature only arrives through another
+  crate's default features. `--all-features` is clean, and so is the workspace
+  build, so it only shows up in that one narrow invocation.
+- rustfs beta is not usable for load testing; see the traps above. The e2e scripts
+  still run against it and pass, because their volumes are small and the
+  replicator retries.
+- The benchmark's `catchup` scenario reports a throughput figure that is mostly
+  fixed cost, so treat it as a latency measurement until item 2 above is done.
+
 ## Migrations
 
 Two migration sets live under `crates/etl/migrations/`:
