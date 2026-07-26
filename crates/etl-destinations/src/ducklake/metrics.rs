@@ -43,6 +43,13 @@ pub(crate) const ETL_DUCKLAKE_BATCH_COMMIT_DURATION_SECONDS: &str =
     "etl_ducklake_batch_commit_duration_seconds";
 pub(crate) const ETL_DUCKLAKE_BATCH_PREPARED_MUTATIONS: &str =
     "etl_ducklake_batch_prepared_mutations";
+/// Time spent in one stage of applying a DuckLake batch.
+///
+/// The stages partition the work inside an open transaction, so their sum is
+/// close to the batch duration and the distribution shows where a batch spends
+/// its time.
+pub(crate) const ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS: &str =
+    "etl_ducklake_batch_stage_duration_seconds";
 pub(crate) const ETL_DUCKLAKE_UPSERT_ROWS: &str = "etl_ducklake_upsert_rows";
 pub(crate) const ETL_DUCKLAKE_DELETE_PREDICATES: &str = "etl_ducklake_delete_predicates";
 pub(crate) const ETL_DUCKLAKE_INLINE_FLUSH_ROWS: &str = "etl_ducklake_inline_flush_rows";
@@ -88,6 +95,7 @@ pub(crate) const BATCH_KIND_LABEL: &str = "batch_kind";
 pub(crate) const TABLE_LABEL: &str = "table";
 pub(crate) const SUB_BATCH_KIND_LABEL: &str = "sub_batch_kind";
 pub(crate) const PREPARED_ROWS_KIND_LABEL: &str = "prepared_rows_kind";
+pub(crate) const STAGE_LABEL: &str = "stage";
 pub(crate) const DELETE_ORIGIN_LABEL: &str = "delete_origin";
 pub(crate) const RETRY_SCOPE_LABEL: &str = "retry_scope";
 pub(crate) const MAINTENANCE_OPERATION_LABEL: &str = "operation";
@@ -187,6 +195,12 @@ pub(crate) fn register_metrics() {
             Unit::Count,
             "Prepared mutation statements per committed DuckLake atomic batch, labeled by \
              batch_kind and sub_batch_kind."
+        );
+        describe_histogram!(
+            ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
+            Unit::Seconds,
+            "Time spent in one stage of applying a DuckLake batch, labeled by batch_kind and \
+             stage."
         );
         describe_histogram!(
             ETL_DUCKLAKE_UPSERT_ROWS,

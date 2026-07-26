@@ -51,10 +51,11 @@ use crate::{
         },
         metrics::{
             BATCH_KIND_LABEL, DELETE_ORIGIN_LABEL, ETL_DUCKLAKE_BATCH_COMMIT_DURATION_SECONDS,
-            ETL_DUCKLAKE_BATCH_PREPARED_MUTATIONS, ETL_DUCKLAKE_DELETE_PREDICATES,
-            ETL_DUCKLAKE_FAILED_BATCHES_TOTAL, ETL_DUCKLAKE_REPLAYED_BATCHES_TOTAL,
-            ETL_DUCKLAKE_RETRIES_TOTAL, ETL_DUCKLAKE_UPSERT_ROWS, PREPARED_ROWS_KIND_LABEL,
-            RETRY_SCOPE_LABEL, SUB_BATCH_KIND_LABEL,
+            ETL_DUCKLAKE_BATCH_PREPARED_MUTATIONS, ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
+            ETL_DUCKLAKE_DELETE_PREDICATES, ETL_DUCKLAKE_FAILED_BATCHES_TOTAL,
+            ETL_DUCKLAKE_REPLAYED_BATCHES_TOTAL, ETL_DUCKLAKE_RETRIES_TOTAL,
+            ETL_DUCKLAKE_UPSERT_ROWS, PREPARED_ROWS_KIND_LABEL, RETRY_SCOPE_LABEL, STAGE_LABEL,
+            SUB_BATCH_KIND_LABEL,
         },
         replay_epoch::LEGACY_REPLAY_EPOCH,
         sql::{qualified_lake_table_name, quote_identifier},
@@ -2028,13 +2029,15 @@ fn apply_table_batch(
 ) -> EtlResult<()> {
     let batch_started = Instant::now();
 
-    conn.execute_batch("BEGIN TRANSACTION").map_err(|error| {
-        tracing::error!(error = %error, "error transaction");
-        etl_error!(
-            ErrorKind::DestinationQueryFailed,
-            "DuckLake BEGIN TRANSACTION failed",
-            source: error
-        )
+    timed_stage(batch.batch_kind, "begin", || {
+        conn.execute_batch("BEGIN TRANSACTION").map_err(|error| {
+            tracing::error!(error = %error, "error transaction");
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake BEGIN TRANSACTION failed",
+                source: error
+            )
+        })
     })?;
 
     let mut reusable_staging_table = ReusableStagingTable::new(
@@ -2060,24 +2063,28 @@ fn apply_table_batch(
             }
         }
 
-        if batch.uses_streaming_progress() {
-            update_table_streaming_progress(conn, batch)?;
-        } else {
-            insert_applied_batch_marker(conn, batch)?;
-        }
+        timed_stage(batch.batch_kind, "marker", || {
+            if batch.uses_streaming_progress() {
+                update_table_streaming_progress(conn, batch)
+            } else {
+                insert_applied_batch_marker(conn, batch)
+            }
+        })?;
         Ok(())
     })();
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT").map_err(|error| {
-                tracing::error!(error = %error, "error commit");
-                reusable_staging_table.cleanup(conn);
-                etl_error!(
-                    ErrorKind::DestinationQueryFailed,
-                    "DuckLake COMMIT failed",
-                    source: error
-                )
+            timed_stage(batch.batch_kind, "commit", || {
+                conn.execute_batch("COMMIT").map_err(|error| {
+                    tracing::error!(error = %error, "error commit");
+                    reusable_staging_table.cleanup(conn);
+                    etl_error!(
+                        ErrorKind::DestinationQueryFailed,
+                        "DuckLake COMMIT failed",
+                        source: error
+                    )
+                })
             })?;
             reusable_staging_table.cleanup(conn);
             histogram!(
@@ -2160,7 +2167,9 @@ fn apply_table_mutation(
                 PREPARED_ROWS_KIND_LABEL => prepared_rows_kind(prepared_rows),
             )
             .record(prepared_rows_count(prepared_rows) as f64);
-            apply_upsert_mutation(conn, prepared_rows, reusable_staging_table)
+            timed_stage(batch.batch_kind, "upsert", || {
+                apply_upsert_mutation(conn, prepared_rows, reusable_staging_table)
+            })
         }
         PreparedTableMutation::Delete { predicates, origin } => {
             histogram!(
@@ -2169,15 +2178,42 @@ fn apply_table_mutation(
                 DELETE_ORIGIN_LABEL => *origin,
             )
             .record(predicates.len() as f64);
-            apply_delete_mutation(conn, batch, predicates.as_slice(), origin, operation_context)
+            timed_stage(batch.batch_kind, "delete", || {
+                apply_delete_mutation(conn, batch, predicates.as_slice(), origin, operation_context)
+            })
         }
-        PreparedTableMutation::Update { assignments, predicate } => apply_update_mutation(
-            conn,
-            &reusable_staging_table.table_name,
-            assignments.as_slice(),
-            predicate,
-        ),
+        PreparedTableMutation::Update { assignments, predicate } => {
+            timed_stage(batch.batch_kind, "update", || {
+                apply_update_mutation(
+                    conn,
+                    &reusable_staging_table.table_name,
+                    assignments.as_slice(),
+                    predicate,
+                )
+            })
+        }
     }
+}
+
+/// Records how long one stage of applying a batch took.
+///
+/// The stages partition the work inside a batch transaction, so comparing their
+/// distributions shows which stage dominates without guessing.
+fn timed_stage<T>(
+    batch_kind: DuckLakeTableBatchKind,
+    stage: &'static str,
+    body: impl FnOnce() -> EtlResult<T>,
+) -> EtlResult<T> {
+    let started = Instant::now();
+    let result = body();
+    histogram!(
+        ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
+        BATCH_KIND_LABEL => batch_kind.as_str(),
+        STAGE_LABEL => stage,
+    )
+    .record(started.elapsed().as_secs_f64());
+
+    result
 }
 
 /// Applies one upsert batch inside an open DuckLake transaction.

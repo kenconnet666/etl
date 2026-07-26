@@ -373,6 +373,19 @@ multi_rows=$((PER_TABLE * (TABLES - 1)))
 report "multi-table insert" "$multi_rows" "$source_ms" "$elapsed" \
   "$(throughput "$multi_rows" "$elapsed")"
 
+log "batch stage distribution"
+# The replicator exports Prometheus metrics on 9000; the stage histogram shows
+# where a batch spends its time instead of leaving it to guesswork.
+if command -v curl >/dev/null 2>&1; then
+  curl -s http://127.0.0.1:9000/metrics 2>/dev/null \
+    | grep -E 'etl_ducklake_batch_stage_duration_seconds|etl_ducklake_(upsert_rows|delete_predicates)|etl_ducklake_pool_checkout_wait|etl_ducklake_blocking_slot_wait' \
+    | grep -vE '_bucket|^#' \
+    | sed 's/etl_ducklake_//' \
+    || echo "no stage metrics scraped"
+else
+  echo "curl is missing, skipping the stage distribution"
+fi
+
 log "analytical queries on the replica"
 if [[ "$DESTINATION" == "ducklake" ]]; then
   for q in "select count(*) from lake.public.\"$TABLE_1\"" \
