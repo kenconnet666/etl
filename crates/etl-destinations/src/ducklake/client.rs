@@ -543,7 +543,14 @@ pub(super) async fn build_warm_ducklake_pool(
         let started = Instant::now();
         let pool = r2d2::Pool::builder()
             .max_size(pool_size)
-            .min_idle(Some(0))
+            // Initializing a DuckLake connection costs roughly a second: the
+            // DuckDB extensions load, the Postgres catalog is attached over the
+            // network, and Parquet settings are applied. Keeping every
+            // connection resident means that cost is paid once per process
+            // rather than once per batch.
+            .min_idle(Some(pool_size))
+            .idle_timeout(None)
+            .max_lifetime(None)
             .connection_timeout(Duration::from_mins(4))
             .test_on_check_out(true)
             // Callers log the returned pool initialization failure once, so
