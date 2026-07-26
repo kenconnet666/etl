@@ -7,11 +7,9 @@
 //! transaction grow unbounded.
 
 #[cfg(feature = "test-utils")]
-use std::collections::HashMap;
-#[cfg(feature = "test-utils")]
 use std::sync::LazyLock;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     error, fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -72,17 +70,17 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 /// A DuckLake delete costs roughly the same whether it removes one row or many,
 /// because it has to locate the Parquet files holding those rows and write a
 /// deletion file either way. Measured on the local stack, one single-predicate
-/// delete took about 109 ms, so the statement count dominates and predicates are
-/// batched generously.
+/// delete took about 109 ms, so the statement count dominates and predicates
+/// are batched generously.
 const SQL_DELETE_BATCH_SIZE: usize = 1024;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
 /// The apply loop already bounds a batch by bytes before it reaches the
-/// destination, so this only guards against an unbounded transaction. It used to
-/// be 16, which split 5000 streamed rows into 313 DuckLake transactions and made
-/// the per-transaction cost dominate: 433 commits at roughly 108 ms each. There
-/// is a single writer, so short transactions buy no conflict avoidance.
+/// destination, so this only guards against an unbounded transaction. It used
+/// to be 16, which split 5000 streamed rows into 313 DuckLake transactions and
+/// made the per-transaction cost dominate: 433 commits at roughly 108 ms each.
+/// There is a single writer, so short transactions buy no conflict avoidance.
 const CDC_MUTATION_BATCH_SIZE: usize = 100_000;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
@@ -1216,45 +1214,96 @@ fn push_prepared_mutation_batch(
     Ok(())
 }
 
-/// A replace-by-key group waiting to be flushed as one delete plus one insert.
+/// The pending effect of one batch on a table, collapsed by key.
 ///
-/// A replace removes the row a key already holds and writes the new one, so a
-/// group can share a single delete and a single insert as long as no key repeats
-/// inside it. A repeat would make the outcome depend on the order rows land in,
-/// so it closes the group instead.
+/// A batch is a set of changes whose combined effect on a key is what the
+/// destination has to store, so ordering matters only within a key. Collapsing
+/// by key turns any mix of inserts, updates, and deletes into at most one
+/// delete of the touched keys followed by one insert of the rows that survive,
+/// which is two statements regardless of how the operations interleave.
+///
+/// A key only joins the delete when something in the batch could have replaced
+/// or removed an existing row, so a batch of plain inserts still writes without
+/// a delete. Rows without a key image cannot be collapsed and are appended in
+/// arrival order instead.
 #[derive(Default)]
-struct PendingReplaceGroup {
-    predicates: Vec<String>,
-    rows: Vec<TableRow>,
-    keys: HashSet<String>,
+struct PendingBatchEffect {
+    /// Touched keys in first-seen order, each with whether a stored row may
+    /// need removing and the row that should end up stored, if any.
+    keyed: Vec<KeyedEffect>,
+    /// Position of each key in `keyed`.
+    positions: HashMap<String, usize>,
+    /// Rows that carry no key image, kept in arrival order.
+    unkeyed: Vec<TableRow>,
 }
 
-impl PendingReplaceGroup {
-    /// Returns whether adding `predicate` would repeat a key in this group.
-    fn conflicts_with(&self, predicate: &str) -> bool {
-        self.keys.contains(predicate)
+/// The collapsed effect of a batch on one key.
+struct KeyedEffect {
+    predicate: String,
+    /// Whether a row already stored under this key has to be removed first.
+    needs_delete: bool,
+    /// The row to store, or [`None`] when the key ends up deleted.
+    row: Option<TableRow>,
+}
+
+impl PendingBatchEffect {
+    /// Returns whether nothing is pending.
+    fn is_empty(&self) -> bool {
+        self.keyed.is_empty() && self.unkeyed.is_empty()
     }
 
-    /// Adds one replaced row to the group.
-    fn push(&mut self, predicate: String, row: TableRow) {
-        self.keys.insert(predicate.clone());
-        self.predicates.push(predicate);
-        self.rows.push(row);
+    /// Records the effect of one change on `predicate`.
+    ///
+    /// `needs_delete` accumulates: once any change in the batch could have
+    /// touched a stored row, the key stays in the delete.
+    fn set(&mut self, predicate: String, needs_delete: bool, row: Option<TableRow>) {
+        match self.positions.get(&predicate) {
+            Some(&position) => {
+                let effect = &mut self.keyed[position];
+                effect.needs_delete |= needs_delete;
+                effect.row = row;
+            }
+            None => {
+                self.positions.insert(predicate.clone(), self.keyed.len());
+                self.keyed.push(KeyedEffect { predicate, needs_delete, row });
+            }
+        }
     }
 
-    /// Drains the group into a delete followed by an insert.
+    /// Records a row the batch inserts without a key image.
+    fn push_unkeyed(&mut self, row: TableRow) {
+        self.unkeyed.push(row);
+    }
+
+    /// Drains the pending effect into an optional delete followed by an insert.
     fn drain_into(&mut self, prepared_mutations: &mut Vec<PreparedTableMutation>) {
-        if self.predicates.is_empty() {
+        if self.is_empty() {
             return;
         }
 
-        prepared_mutations.push(PreparedTableMutation::Delete {
-            predicates: std::mem::take(&mut self.predicates),
-            origin: "replace",
-        });
-        prepared_mutations
-            .push(PreparedTableMutation::Upsert(prepare_rows(std::mem::take(&mut self.rows))));
-        self.keys.clear();
+        let keyed = std::mem::take(&mut self.keyed);
+        self.positions.clear();
+
+        let mut predicates = Vec::new();
+        let mut rows = Vec::with_capacity(keyed.len());
+        for effect in keyed {
+            if effect.needs_delete {
+                predicates.push(effect.predicate);
+            }
+            if let Some(row) = effect.row {
+                rows.push(row);
+            }
+        }
+
+        if !predicates.is_empty() {
+            prepared_mutations
+                .push(PreparedTableMutation::Delete { predicates, origin: "collapsed" });
+        }
+
+        rows.extend(std::mem::take(&mut self.unkeyed));
+        if !rows.is_empty() {
+            prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(rows)));
+        }
     }
 }
 
@@ -1264,55 +1313,42 @@ fn prepare_table_mutations(
     mutations: Vec<TableMutation>,
 ) -> EtlResult<Vec<PreparedTableMutation>> {
     let mut prepared_mutations = Vec::new();
-    let mut upsert_rows = Vec::new();
-    let mut delete_predicates = Vec::new();
-    let mut replaces = PendingReplaceGroup::default();
+    let mut effect = PendingBatchEffect::default();
+
+    // A table without a replica identity never sends a key image, so its rows
+    // cannot be collapsed and are appended in arrival order.
+    let collapsible = replicated_table_schema.identity_column_schemas().count() > 0;
 
     for mutation in mutations {
         match mutation {
             TableMutation::Insert(row) => {
-                replaces.drain_into(&mut prepared_mutations);
-                if !delete_predicates.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Delete {
-                        predicates: std::mem::take(&mut delete_predicates),
-                        origin: "delete",
-                    });
+                if collapsible {
+                    // A later change to the same key in this batch has to be able
+                    // to supersede this row, so it joins the collapse instead of
+                    // being appended blindly.
+                    let predicate = delete_predicate_from_row(replicated_table_schema, &row)?;
+                    effect.set(predicate, false, Some(row));
+                } else {
+                    effect.push_unkeyed(row);
                 }
-                upsert_rows.push(row);
             }
             TableMutation::Delete(row) => {
-                replaces.drain_into(&mut prepared_mutations);
-                if !upsert_rows.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                        std::mem::take(&mut upsert_rows),
-                    )));
-                }
-                delete_predicates.push(delete_predicate_from_row(replicated_table_schema, &row)?);
+                let predicate = delete_predicate_from_row(replicated_table_schema, &row)?;
+                effect.set(predicate, true, None);
+            }
+            TableMutation::Replace(row) => {
+                let predicate = delete_predicate_from_row(replicated_table_schema, &row)?;
+                effect.set(predicate, true, Some(row));
             }
             TableMutation::Update { delete_row, new_row } => {
-                if !upsert_rows.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                        std::mem::take(&mut upsert_rows),
-                    )));
-                }
-                if !delete_predicates.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Delete {
-                        predicates: std::mem::take(&mut delete_predicates),
-                        origin: "delete",
-                    });
-                }
                 let predicate = delete_predicate_from_row(replicated_table_schema, &delete_row)?;
                 match new_row {
-                    UpdatedTableRow::Full(upsert_row) => {
-                        // The old image locates the row, so this is a replace
-                        // that happens to know its previous key.
-                        if replaces.conflicts_with(&predicate) {
-                            replaces.drain_into(&mut prepared_mutations);
-                        }
-                        replaces.push(predicate, upsert_row);
-                    }
+                    UpdatedTableRow::Full(row) => effect.set(predicate, true, Some(row)),
                     UpdatedTableRow::Partial(partial_row) => {
-                        replaces.drain_into(&mut prepared_mutations);
+                        // A partial update leaves the columns the source did not
+                        // send untouched, so it cannot be expressed as a whole
+                        // row and has to run against what is already stored.
+                        effect.drain_into(&mut prepared_mutations);
                         prepared_mutations.push(PreparedTableMutation::Update {
                             assignments: update_assignments_from_partial_row(
                                 replicated_table_schema,
@@ -1323,38 +1359,10 @@ fn prepare_table_mutations(
                     }
                 }
             }
-            TableMutation::Replace(row) => {
-                if !upsert_rows.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                        std::mem::take(&mut upsert_rows),
-                    )));
-                }
-                if !delete_predicates.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Delete {
-                        predicates: std::mem::take(&mut delete_predicates),
-                        origin: "delete",
-                    });
-                }
-
-                let predicate = delete_predicate_from_row(replicated_table_schema, &row)?;
-                if replaces.conflicts_with(&predicate) {
-                    replaces.drain_into(&mut prepared_mutations);
-                }
-                replaces.push(predicate, row);
-            }
         }
     }
 
-    replaces.drain_into(&mut prepared_mutations);
-    if !upsert_rows.is_empty() {
-        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(upsert_rows)));
-    }
-    if !delete_predicates.is_empty() {
-        prepared_mutations.push(PreparedTableMutation::Delete {
-            predicates: delete_predicates,
-            origin: "delete",
-        });
-    }
+    effect.drain_into(&mut prepared_mutations);
 
     Ok(prepared_mutations)
 }
@@ -3052,7 +3060,7 @@ mod tests {
         match &prepared[0] {
             PreparedTableMutation::Delete { predicates, origin } => {
                 assert_eq!(predicates, &vec!["\"id\" = 1".to_owned()]);
-                assert_eq!(origin, &"replace");
+                assert_eq!(origin, &"collapsed");
             }
             PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
                 panic!("expected delete first")
@@ -3321,14 +3329,13 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 3);
+                // Interleaving no longer splits the batch: the whole mix
+                // collapses into one delete of the touched keys followed by one
+                // insert of the surviving rows.
+                assert_eq!(prepared.len(), 2);
+                assert!(matches!(prepared[0], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
-                    prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[2],
+                    prepared[1],
                     PreparedTableMutation::Upsert(PreparedRows::Appender(_))
                 ));
             }
@@ -3372,7 +3379,7 @@ mod tests {
                 assert_eq!(prepared.len(), 1);
                 match &prepared[0] {
                     PreparedTableMutation::Delete { predicates, origin } => {
-                        assert_eq!(origin, &"delete");
+                        assert_eq!(origin, &"collapsed");
                         assert_eq!(
                             predicates,
                             &vec!["\"id\" = 1".to_owned(), "\"id\" = 2".to_owned()]
@@ -3432,15 +3439,20 @@ mod tests {
         assert_eq!(batches.len(), 1);
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 4);
-                assert!(matches!(prepared[0], PreparedTableMutation::Delete { .. }));
+                // Two updates on different keys collapse into one delete of both
+                // keys followed by one insert of both new rows.
+                assert_eq!(prepared.len(), 2);
+                match &prepared[0] {
+                    PreparedTableMutation::Delete { predicates, origin } => {
+                        assert_eq!(origin, &"collapsed");
+                        assert_eq!(predicates.len(), 2);
+                    }
+                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                        panic!("expected a collapsed delete first")
+                    }
+                }
                 assert!(matches!(
                     prepared[1],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(prepared[2], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[3],
                     PreparedTableMutation::Upsert(PreparedRows::Appender(_))
                 ));
             }
@@ -3548,18 +3560,12 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 4);
+                // Inserts and an update collapse into one delete of the updated
+                // key followed by one insert carrying every surviving row.
+                assert_eq!(prepared.len(), 2);
+                assert!(matches!(prepared[0], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
-                    prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[2],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(
-                    prepared[3],
+                    prepared[1],
                     PreparedTableMutation::Upsert(PreparedRows::Appender(_))
                 ));
             }
