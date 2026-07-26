@@ -88,9 +88,34 @@ docker compose -f .docker/local/docker-compose.yml up -d
 | `source-pg` | 15432 | Replication source |
 | `catalog-pg` | 15434 | DuckLake catalog |
 | `rustfs` | 19000 / 19001 | S3 API and console |
+| `doris-fe` | 18030 / 19030 | Doris HTTP (Stream Load) and MySQL protocol |
+| `doris-be` | — | Doris backend |
 
 Copy `.docker/local/.env.example` to `.docker/local/.env` to override the
 generated passwords.
+
+The Doris containers need static addresses because the image entrypoint rejects
+hostnames in `FE_SERVERS`, and `priority_networks` must name the container
+network because WSL2 gives each distribution its own loopback namespace. The
+official images assume the JVM can read container limits through cgroups; where
+that fails, point `DORIS_FE_IMAGE` and `DORIS_BE_IMAGE` at images whose
+`JAVA_OPTS` include `-XX:-UseContainerSupport`.
+
+## End-to-end verification
+
+Two scripts drive the real `etl-replicator` binary against the local stack and
+assert on the destination. They are the only coverage for configuration loading,
+S3 storage, and the Doris wire protocol.
+
+```bash
+scripts/bin/e2e-ducklake.sh
+scripts/bin/e2e-doris.sh
+```
+
+Both check the initial copy, streamed inserts, updates, and deletes collapsing
+to the current source state, a followed column addition, a followed type
+widening, and a truncate. The DuckLake script also checks a column rename and a
+table rename. `e2e-doris.sh` needs a `mysql` client on `PATH`.
 
 ## Migrations
 
