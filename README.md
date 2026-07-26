@@ -52,6 +52,21 @@ APP_ENVIRONMENT=dev cargo run --release
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the local stack, migrations, and tests.
 
+## Recovering from divergence
+
+The replica holds no authority over the data, so recovery is a fresh copy rather
+than a repair. `scripts/bin/verify-replica.sh` compares source row counts against
+the replica, and `etl-resync` resets table state so the replicator drops the
+destination table and copies it again.
+
+```bash
+scripts/bin/verify-replica.sh --destination doris
+etl-resync --table-id "$(psql "$SOURCE_DSN" -qtAc "select 'public.orders'::regclass::oid")"
+```
+
+Run `etl-resync` while the replicator is stopped, then start it to perform the
+copy.
+
 ## License
 
 Apache-2.0. See `LICENSE` for details.

@@ -114,8 +114,30 @@ scripts/bin/e2e-doris.sh
 
 Both check the initial copy, streamed inserts, updates, and deletes collapsing
 to the current source state, a followed column addition, a followed type
-widening, and a truncate. The DuckLake script also checks a column rename and a
-table rename. `e2e-doris.sh` needs a `mysql` client on `PATH`.
+widening, and a truncate. The DuckLake script also checks a column rename, a
+table rename, and recovery through a resync. The Doris script also checks native
+array columns and a changed primary key value. `e2e-doris.sh` needs a `mysql`
+client on `PATH`.
+
+## Recovering a divergent table
+
+The replica is disposable: when a table no longer matches its source, the fix is
+to copy it again rather than to repair it in place.
+
+```bash
+# Detect: compare source row counts against the replica.
+CATALOG_CONNINFO='host=localhost port=15434 dbname=ducklake_catalog user=postgres password=changeme' \
+  scripts/bin/verify-replica.sh --destination ducklake --pipeline-id 9001
+scripts/bin/verify-replica.sh --destination doris --pipeline-id 9002
+
+# Recover: reset table state, then start the replicator to run the copy.
+etl-resync --table-id "$(psql "$SOURCE_DSN" -qtAc "select 'public.orders'::regclass::oid")"
+```
+
+Replication is asynchronous, so a difference on a table that is being written to
+may just be lag; rerun and see whether it persists. `etl-resync` has to run
+while the replicator is stopped, because a running replicator keeps table state
+in memory.
 
 ## Migrations
 

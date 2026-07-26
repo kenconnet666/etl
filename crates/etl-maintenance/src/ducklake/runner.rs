@@ -57,8 +57,14 @@ const TARGET_FILE_SIZE_OPTION_NAME: &str = "target_file_size";
 const MAINTENANCE_TARGET_FILE_SIZE: &str = "500MB";
 /// Minimum snapshot-retention interval accepted by the maintenance runner.
 const MIN_EXPIRE_SNAPSHOTS_OLDER_THAN: &str = "1 day";
-/// Minimum old-file cleanup grace window used by DuckLake cleanup.
-const CLEANUP_OLD_FILES_OLDER_THAN: &str = "1 hour";
+/// Grace window before DuckLake deletes a file no snapshot references.
+///
+/// Deleting a file is not reversible, and the cost of keeping one longer is
+/// storage rather than correctness, so the window matches snapshot retention: a
+/// file becomes eligible only once every snapshot that could reference it has
+/// expired. This also leaves room for a long-running query and for eventually
+/// consistent object storage to settle.
+const CLEANUP_OLD_FILES_OLDER_THAN: &str = "7 days";
 const PARQUET_COMPRESSION_OPTION_NAME: &str = "parquet_compression";
 const PARQUET_COMPRESSION_OPTION_VALUE: &str = "zstd";
 const PARQUET_ROW_GROUP_SIZE_BYTES_OPTION_NAME: &str = "parquet_row_group_size_bytes";
@@ -3793,11 +3799,11 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_old_files_sql_uses_one_hour_retention() {
+    fn cleanup_old_files_sql_uses_the_grace_window() {
         assert_eq!(
             cleanup_old_files_sql(),
             "CALL ducklake_cleanup_old_files('lake', older_than => CAST(now() AS TIMESTAMP) - \
-             CAST('1 hour' AS INTERVAL));"
+             CAST('7 days' AS INTERVAL));"
         );
     }
 
