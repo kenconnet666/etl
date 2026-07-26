@@ -809,6 +809,59 @@ pub enum ColumnModification {
 mod tests {
     use super::*;
 
+    /// Builds the schema shape the end-to-end check exercises: a renamed
+    /// column, a widened column, and an added column in one step.
+    #[test]
+    fn diff_reports_a_rename_and_a_type_change_together() {
+        let old_schema = ReplicatedTableSchema::from_mask(
+            std::sync::Arc::new(TableSchema::new(
+                TableId::new(1),
+                TableName::new("public".to_owned(), "orders".to_owned()),
+                vec![
+                    ColumnSchema::new("id".to_owned(), Type::INT8, -1, 1, false)
+                        .with_primary_key(1),
+                    ColumnSchema::new("customer".to_owned(), Type::TEXT, -1, 2, false),
+                    ColumnSchema::new("quantity".to_owned(), Type::INT4, -1, 3, false),
+                ],
+            )),
+            ReplicationMask::from_bytes(vec![1, 1, 1]),
+        );
+        let new_schema = ReplicatedTableSchema::from_mask(
+            std::sync::Arc::new(TableSchema::new(
+                TableId::new(1),
+                TableName::new("public".to_owned(), "orders".to_owned()),
+                vec![
+                    ColumnSchema::new("id".to_owned(), Type::INT8, -1, 1, false)
+                        .with_primary_key(1),
+                    ColumnSchema::new("buyer".to_owned(), Type::TEXT, -1, 2, false),
+                    ColumnSchema::new("quantity".to_owned(), Type::INT8, -1, 3, false),
+                    ColumnSchema::new("channel".to_owned(), Type::TEXT, -1, 4, true),
+                ],
+            )),
+            ReplicationMask::from_bytes(vec![1, 1, 1, 1]),
+        );
+
+        let diff = old_schema.diff(&new_schema);
+
+        assert_eq!(diff.columns_to_add.len(), 1);
+        assert!(diff.columns_to_remove.is_empty());
+        assert_eq!(diff.columns_to_change.len(), 2);
+
+        let renamed = &diff.columns_to_change[0];
+        assert_eq!(renamed.ordinal_position, 2);
+        assert!(matches!(
+            renamed.modifications.as_slice(),
+            [ColumnModification::Rename { .. }]
+        ));
+
+        let retyped = &diff.columns_to_change[1];
+        assert_eq!(retyped.ordinal_position, 3);
+        assert!(matches!(
+            retyped.modifications.as_slice(),
+            [ColumnModification::Type { old_type: Type::INT4, new_type: Type::INT8, .. }]
+        ));
+    }
+
     fn create_test_table_schema() -> TableSchema {
         TableSchema::new(
             TableId::new(123),

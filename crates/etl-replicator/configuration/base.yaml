@@ -1,0 +1,10 @@
+# Settings shared by every environment.
+#
+# Anything under `pipeline` that has a default is omitted so the compiled
+# defaults stay the single source of truth. Environment files below add the
+# source connection and the destination.
+pipeline:
+  # Overridden per environment; kept here so a missing override fails loudly
+  # instead of silently replicating under an unexpected identity.
+  id: 1
+  publication_name: etl_publication

@@ -41,8 +41,14 @@ pyvenv.cfg
 vendor/duckdb/extensions/
 
 # Configuration files
-crates/etl-replicator/configuration
 configuration
+# The replicator ships base and development files so `APP_ENVIRONMENT=dev cargo
+# run` works out of the box. They hold the same development placeholders as the
+# committed compose file; real deployments override them with `APP_`-prefixed
+# environment variables.
+!crates/etl-replicator/configuration/
+!crates/etl-replicator/configuration/base.yaml
+!crates/etl-replicator/configuration/dev.yaml
 
 # Nix
 result
