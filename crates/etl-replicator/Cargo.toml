@@ -8,6 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
+name = "etl-resync"
+path = "src/bin/etl-resync.rs"
+
+[[bin]]
 name = "etl-ducklake-maintenance"
 path = "src/bin/etl-ducklake-maintenance.rs"
 required-features = ["ducklake"]
@@ -26,6 +30,7 @@ etl = { workspace = true }
 etl-config = { workspace = true, features = ["supabase"] }
 etl-destinations = { workspace = true }
 etl-maintenance = { workspace = true }
+etl-postgres = { workspace = true, features = ["store"] }
 etl-telemetry = { workspace = true }
 metrics = { workspace = true }
 reqwest = { workspace = true, features = ["rustls", "json"] }

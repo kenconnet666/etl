@@ -1390,6 +1390,7 @@ dependencies = [
  "etl-config",
  "etl-destinations",
  "etl-maintenance",
+ "etl-postgres",
  "etl-telemetry",
  "metrics",
  "reqwest 0.13.4",

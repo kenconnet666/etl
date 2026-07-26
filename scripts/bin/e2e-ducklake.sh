@@ -62,6 +62,11 @@ source_sql() {
   psql "$SOURCE_DSN" -v ON_ERROR_STOP=1 -q -c "$1"
 }
 
+# Returns a single value from the source database.
+source_query() {
+  psql "$SOURCE_DSN" -v ON_ERROR_STOP=1 -qtAc "$1"
+}
+
 lake_query() {
   # Setup statements print their own results, so the value under test is tagged
   # and extracted by tag instead of by position. A trailing semicolon is dropped
@@ -138,7 +143,7 @@ psql "$CATALOG_DSN" -v ON_ERROR_STOP=1 -q -c "
 psql "$CATALOG_DSN" -v ON_ERROR_STOP=1 -q -c "drop schema if exists etl cascade"
 
 log "building the replicator"
-cargo build --release -p etl-replicator --features ducklake
+cargo build --release -p etl-replicator --features ducklake --bins
 [[ -x "$REPLICATOR_BIN" ]] || {
   echo "built binary not found at $REPLICATOR_BIN" >&2
   exit 1
@@ -153,14 +158,43 @@ DUCKDB_LIB_DIR="$(dirname "$(find "$TARGET_DIR" -name libduckdb.so -print -quit)
 }
 
 log "starting the replicator"
-APP_ENVIRONMENT=dev \
-APP_PIPELINE__ID="$PIPELINE_ID" \
-APP_PIPELINE__PUBLICATION_NAME="$PUBLICATION" \
-LD_LIBRARY_PATH="$DUCKDB_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-RUST_LOG="${RUST_LOG:-info}" \
-  "$REPLICATOR_BIN" > "$LOG_FILE" 2>&1 &
-REPLICATOR_PID=$!
-echo "replicator pid $REPLICATOR_PID, log $LOG_FILE"
+
+# Applies statements to the lake, used to diverge the destination on purpose.
+lake_write() {
+  "$DUCKDB" -noheader -list -c "
+    install ducklake; load ducklake;
+    install postgres; load postgres;
+    install httpfs; load httpfs;
+    set preserve_insertion_order = false;
+    create or replace secret lake_storage (
+      type s3, key_id 'minioadmin', secret 'minioadmin',
+      endpoint 'localhost:19000', url_style 'path', use_ssl false
+    );
+    attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path 's3://lake/ducklake');
+    $1
+  " >/dev/null
+}
+
+start_replicator() {
+  APP_ENVIRONMENT=dev \
+  APP_PIPELINE__ID="$PIPELINE_ID" \
+  APP_PIPELINE__PUBLICATION_NAME="$PUBLICATION" \
+  LD_LIBRARY_PATH="$DUCKDB_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  RUST_LOG="${RUST_LOG:-info}" \
+    "$REPLICATOR_BIN" >> "$LOG_FILE" 2>&1 &
+  REPLICATOR_PID=$!
+  echo "replicator pid $REPLICATOR_PID, log $LOG_FILE"
+}
+
+stop_replicator() {
+  if [[ -n "$REPLICATOR_PID" ]] && kill -0 "$REPLICATOR_PID" 2>/dev/null; then
+    kill "$REPLICATOR_PID" 2>/dev/null || true
+    wait "$REPLICATOR_PID" 2>/dev/null || true
+  fi
+  REPLICATOR_PID=""
+}
+
+start_replicator
 
 expect_lake "initial copy landed two rows" \
   "select count(*) from lake.public.\"$TABLE\";" "2"
@@ -204,5 +238,30 @@ source_sql "truncate table public.\"${TABLE}_renamed\""
 
 expect_lake "the truncate replicated" \
   "select count(*) from lake.public.\"${TABLE}_renamed\";" "0"
+
+log "recovering from destination divergence with a resync"
+source_sql "insert into public.\"${TABLE}_renamed\" values (6, 'frank', 8, 8.00, 'store')"
+expect_lake "the source row replicated before the resync" \
+  "select count(*) from lake.public.\"${TABLE}_renamed\";" "1"
+
+# The replica is disposable, so recovery means copying the table again rather
+# than repairing it. Diverging the destination on purpose proves that path.
+stop_replicator
+lake_write "delete from lake.public.\"${TABLE}_renamed\" where id = 6;
+            insert into lake.public.\"${TABLE}_renamed\"
+              values (99, 'stale', 1, 1.00, 'stale');"
+
+TABLE_OID="$(source_query "select 'public.\"${TABLE}_renamed\"'::regclass::oid")"
+echo "resetting table oid $TABLE_OID"
+APP_ENVIRONMENT=dev \
+APP_PIPELINE__ID="$PIPELINE_ID" \
+APP_PIPELINE__PUBLICATION_NAME="$PUBLICATION" \
+  "$TARGET_DIR/release/etl-resync" --table-id "$TABLE_OID"
+
+start_replicator
+expect_lake "the resync rebuilt the table from the source" \
+  "select string_agg(id || ':' || buyer, ',' order by id)
+   from lake.public.\"${TABLE}_renamed\";" \
+  "6:frank"
 
 log "all end-to-end checks passed"
