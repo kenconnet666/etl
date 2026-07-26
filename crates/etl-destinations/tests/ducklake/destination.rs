@@ -83,6 +83,23 @@ fn make_schema(table_id: u32, schema: &str, table: &str) -> TableSchema {
     )
 }
 
+/// Builds a schema whose third column maps to VARIANT.
+///
+/// A VARIANT column cannot be written through the appender, so the destination
+/// stages the batch as JSON text and casts on insert. Plain scalar columns are
+/// written straight to the lake table instead.
+fn make_schema_with_json(table_id: u32, schema: &str, table: &str) -> TableSchema {
+    TableSchema::new(
+        TableId::new(table_id),
+        TableName::new(schema.to_owned(), table.to_owned()),
+        vec![
+            ColumnSchema::new("id".to_owned(), PgType::INT4, -1, 1, false).with_primary_key(1),
+            ColumnSchema::new("name".to_owned(), PgType::TEXT, -1, 2, true),
+            ColumnSchema::new("payload".to_owned(), PgType::JSONB, -1, 3, true),
+        ],
+    )
+}
+
 fn make_schema_with_email(previous_schema: &TableSchema, snapshot_id: u64) -> TableSchema {
     TableSchema::with_snapshot_id(
         previous_schema.id,
@@ -2828,7 +2845,7 @@ async fn write_events_reuses_one_staging_table_per_atomic_batch() {
     let data_url = lake.data_url.clone();
 
     let _table_id = TableId::new(19);
-    let schema = make_schema(19, "public", "staging_reuse");
+    let schema = make_schema_with_json(19, "public", "staging_reuse");
     let replicated_table_schema = make_replicated_table_schema(&schema);
     let table_name = table_name_to_ducklake_table_name(&schema.name).unwrap();
 
@@ -2856,7 +2873,11 @@ async fn write_events_reuses_one_staging_table_per_atomic_batch() {
                 commit_lsn: lsn,
                 tx_ordinal: 0,
                 replicated_table_schema: replicated_table_schema.clone(),
-                table_row: TableRow::new(vec![Cell::I32(1), Cell::String("before".to_owned())]),
+                table_row: TableRow::new(vec![
+                    Cell::I32(1),
+                    Cell::String("before".to_owned()),
+                    Cell::Json(serde_json::json!({ "v": 1 })),
+                ]),
             }),
             Event::Update(UpdateEvent {
                 start_lsn: lsn,
@@ -2866,10 +2887,12 @@ async fn write_events_reuses_one_staging_table_per_atomic_batch() {
                 updated_table_row: UpdatedTableRow::Full(TableRow::new(vec![
                     Cell::I32(1),
                     Cell::String("after".to_owned()),
+                    Cell::Json(serde_json::json!({ "v": 2 })),
                 ])),
                 old_table_row: Some(OldTableRow::Full(TableRow::new(vec![
                     Cell::I32(1),
                     Cell::String("before".to_owned()),
+                    Cell::Json(serde_json::json!({ "v": 1 })),
                 ]))),
             }),
             Event::Insert(InsertEvent {
@@ -2877,7 +2900,11 @@ async fn write_events_reuses_one_staging_table_per_atomic_batch() {
                 commit_lsn: lsn,
                 tx_ordinal: 2,
                 replicated_table_schema: replicated_table_schema.clone(),
-                table_row: TableRow::new(vec![Cell::I32(2), Cell::String("tail".to_owned())]),
+                table_row: TableRow::new(vec![
+                    Cell::I32(2),
+                    Cell::String("tail".to_owned()),
+                    Cell::Json(serde_json::json!({ "v": 3 })),
+                ]),
             }),
         ])
         .await
