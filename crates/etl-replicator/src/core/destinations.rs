@@ -75,6 +75,7 @@ mod doris {
             database,
             stream_load_timeout_secs,
             replication_num,
+            schema_follow,
         } = &replicator_config.destination
         else {
             return Err(ReplicatorError::config(std::io::Error::other(
@@ -101,7 +102,8 @@ mod doris {
             replication_num: *replication_num,
         };
 
-        let destination = DorisDestination::new(doris_config, store.clone()).await?;
+        let destination =
+            DorisDestination::new(doris_config, *schema_follow, store.clone()).await?;
 
         let pipeline = Pipeline::new(replicator_config.pipeline, store, destination);
         pipeline::start(pipeline).await

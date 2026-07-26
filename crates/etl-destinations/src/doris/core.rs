@@ -28,6 +28,7 @@ use etl::{
     schema::{ColumnModification, ReplicatedTableSchema, SchemaDiff, TableId},
     store::DestinationStore,
 };
+use etl_config::shared::SchemaFollowConfig;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -63,6 +64,8 @@ pub struct DorisDestination<S> {
     stream_load: DorisStreamLoadClient,
     ddl: DorisDdlClient,
     store: S,
+    /// Which source schema changes this destination follows.
+    schema_follow: SchemaFollowConfig,
     /// Serializes DDL so two tables never race one Doris schema-change job.
     ddl_lock: Arc<Mutex<()>>,
     /// Sequence that keeps table-copy load labels unique across batches.
@@ -79,7 +82,11 @@ where
     S: DestinationStore,
 {
     /// Connects to Doris and creates the target database when it is missing.
-    pub async fn new(config: DorisConfig, store: S) -> EtlResult<Self> {
+    pub async fn new(
+        config: DorisConfig,
+        schema_follow: SchemaFollowConfig,
+        store: S,
+    ) -> EtlResult<Self> {
         let stream_load = DorisStreamLoadClient::new(config.clone())?;
         let ddl = DorisDdlClient::connect(&config).await?;
         ddl.ensure_database(&config.database).await?;
@@ -89,6 +96,7 @@ where
             stream_load,
             ddl,
             store,
+            schema_follow,
             ddl_lock: Arc::new(Mutex::new(())),
             copy_batch_sequence: Arc::new(AtomicU64::new(0)),
             copy_run_nonce: rand::random(),
@@ -279,6 +287,14 @@ where
         }
 
         for column_schema in &diff.columns_to_remove {
+            if !self.schema_follow.drop_column {
+                debug!(
+                    table = %table_name,
+                    column = %column_schema.name,
+                    "doris drop column skipped because dropping columns is not followed"
+                );
+                continue;
+            }
             // Doris refuses to drop a key column, and a key change cannot be
             // expressed in place on a unique-key table.
             if layout.key_columns.contains(&column_schema.name) {
@@ -309,6 +325,14 @@ where
                         self.ddl.execute_async_schema_change(&sql, table_name).await?;
                     }
                     ColumnModification::Type { .. } => {
+                        if !self.schema_follow.change_type {
+                            debug!(
+                                table = %table_name,
+                                column = %change.new_column.name,
+                                "doris type change skipped because type changes are not followed"
+                            );
+                            continue;
+                        }
                         if layout.key_columns.contains(&change.new_column.name) {
                             warn!(
                                 table = %table_name,
@@ -489,6 +513,10 @@ where
                 }
                 Event::Truncate(truncate) => {
                     self.flush(&mut buffers, &mut batch_index).await?;
+                    if !self.schema_follow.truncate {
+                        debug!("doris truncate skipped because truncate is not followed");
+                        continue;
+                    }
                     for replicated_table_schema in &truncate.truncated_tables {
                         let table_name = self.ensure_table_ready(replicated_table_schema).await?;
                         let _ddl_permit = self.ddl_lock.lock().await;
