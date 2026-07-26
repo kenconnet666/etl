@@ -235,6 +235,20 @@ The fixed cost is the batch fill window, connection setup, and the benchmark's
 own polling granularity. It dominates at 100,000 rows and fades at 1,000,000,
 which is why a figure is only comparable against another at the same row count.
 
+**The two destinations differ only where the fixed cost differs.** At 1,000,000
+rows Doris and DuckLake stream within a few percent of each other on inserts,
+updates, and deletes, because both collapse a batch by key first and then issue a
+single write: DuckLake one staged-key delete plus one insert, Doris one Stream
+Load. The initial copy separates them — 120,163 rows/s against 29,670 — entirely
+because DuckLake pays the ~18 s described below to materialise Parquet and commit
+catalog snapshots, while Doris absorbs the batch as one load.
+
+Collapsing by key is what makes the interleaved scenario tractable at all. Before
+it, a Doris batch opened a new Stream Load whenever a key repeated, so a stream
+that inserts, updates, and deletes the same keys cost one HTTP round trip per
+operation switch and the scenario never finished. The same shape of fix on the
+DuckLake side took it from never finishing to 1.6 s at 5,000 rows.
+
 **Throughput is bounded by the source, not by this code.** Draining the same
 1,000,000 rows from an equivalent slot with `pg_recvlogical` straight into
 `/dev/null` — no row decoding, no destination — takes 25.9 s, or 38,630 rows/s.

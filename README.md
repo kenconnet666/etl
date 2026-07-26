@@ -21,7 +21,7 @@ flowchart LR
 | --- | --- |
 | Consistency | Eventual. Replication is at-least-once, and every destination write is idempotent. |
 | Data shape | Current state of the source, not an event log. Updates overwrite and deletes remove. |
-| Schema changes | Added, dropped, renamed, and retyped columns are followed, as are table renames. |
+| Schema changes | Added, dropped, renamed, and retyped columns are followed, as are table renames. Dropping and retyping discard data, so both are switchable. |
 | Types | Strongly typed wherever the destination can express the Postgres type, with text as a lossless fallback. |
 | Tables without a key | A source table with no primary key and no `replica identity full` degrades to an append-only log, because the source never sends a key image. |
 
@@ -52,6 +52,24 @@ APP_ENVIRONMENT=dev cargo run --release
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the local stack, migrations, and tests.
 
+### Schema change policy
+
+Adding and renaming a column only add information, so both are always followed.
+Dropping a column, retyping one, and emptying a table on `TRUNCATE` discard data
+in the replica, so each can be switched off per destination:
+
+```yaml
+destination:
+  ducklake:
+    schema_follow:
+      drop_column: false
+      change_type: true
+      truncate: true
+```
+
+A change that is not followed is logged and skipped; the source and the replica
+then differ in shape, and `etl-resync` is the way back to a matching one.
+
 ## Performance
 
 Measured on one developer machine (WSL2 Debian, Postgres 18 source, Postgres 18
@@ -60,20 +78,26 @@ numbers). Throughput is `rows * 1000 / elapsed_ms`; these are single observation
 rather than percentiles, and the source write time is reported alongside rather
 than subtracted, so each figure is end to end.
 
-| Scenario | Rows | Source write | To the replica | Rows/s |
+| Scenario | Rows | Source write | DuckLake rows/s | Doris rows/s |
 | --- | --- | --- | --- | --- |
-| Initial copy, catching up a backlog | 1,000,000 | 7,428 ms | 33,703 ms | 29,670 |
-| Streaming insert | 1,000,000 | 8,393 ms | 27,451 ms | 36,428 |
-| Streaming insert, 4 tables | 750,000 | 6,087 ms | 16,360 ms | 45,843 |
-| Interleaved insert/update/delete | 500,000 | 22,495 ms | 29,949 ms | 16,695 |
-| Warm update | 1,000,000 | 9,787 ms | 34,119 ms | 29,309 |
-| Warm delete | 500,000 | 1,013 ms | 10,217 ms | 48,938 |
+| Initial copy, catching up a backlog | 1,000,000 | ~8,000 ms | 29,670 | 120,163 |
+| Streaming insert | 1,000,000 | ~8,500 ms | 37,601 | 36,756 |
+| Streaming insert, 4 tables | 750,000 | ~6,000 ms | 46,097 | 46,842 |
+| Warm update | 1,000,000 | ~9,500 ms | 30,447 | 32,466 |
+| Warm delete | 500,000 | ~1,700 ms | 48,477 | 54,656 |
+| Interleaved insert/update/delete | 500,000 | ~22,500 ms | 17,442 | 18,660 |
 
 Streaming throughput sits in the same range across inserts, updates, and deletes,
-because a batch collapses by key into one delete matched through staged keys plus
-one insert, whatever mix of operations it contains. The interleaved figure is
-lower mostly on the source side: generating it row by row in a PL/pgSQL loop
-takes 22 s of the 30 s.
+and across the two destinations, because a batch collapses by key before it is
+written: DuckLake applies one delete matched through staged keys plus one insert,
+and Doris issues one Stream Load, whatever mix of operations the batch contains.
+The interleaved figure is lower mostly on the source side, where generating it row
+by row in a PL/pgSQL loop takes 22 s of the 27 s.
+
+The initial copy is where the two destinations separate. Doris absorbs a copy
+batch as a single Stream Load, while DuckLake pays a fixed cost of roughly 18 s
+per run to materialise Parquet files and commit catalog snapshots, which at this
+row count is most of the difference.
 
 Scale matters when reading these. At 100,000 rows the same scenarios measure
 roughly 25,000 rows/s, because a fixed cost of about 1.5 s per scenario — the
