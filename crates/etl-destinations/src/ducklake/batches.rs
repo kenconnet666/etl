@@ -25,7 +25,7 @@ use etl::{
     error::{ErrorKind, EtlResult},
     etl_error,
     event::EventSequenceKey,
-    schema::ReplicatedTableSchema,
+    schema::{ReplicatedTableSchema, Type},
 };
 use metrics::{counter, histogram};
 #[cfg(feature = "test-utils")]
@@ -320,6 +320,18 @@ fn replicated_column_names(replicated_table_schema: &ReplicatedTableSchema) -> V
     replicated_table_schema.column_schemas().map(|column| column.name.clone()).collect()
 }
 
+/// Returns the columns the destination stores as `VARIANT`.
+///
+/// A `VARIANT` cannot be written through the appender or Arrow, so staging
+/// accepts these columns as `JSON` text and the insert casts them.
+fn variant_column_names(replicated_table_schema: &ReplicatedTableSchema) -> Vec<String> {
+    replicated_table_schema
+        .column_schemas()
+        .filter(|column| matches!(column.typ, Type::JSON | Type::JSONB))
+        .map(|column| column.name.clone())
+        .collect()
+}
+
 /// Prepared per-table work executed atomically in one DuckLake transaction.
 enum PreparedDuckLakeTableBatchAction {
     Mutation(Vec<PreparedTableMutation>),
@@ -337,6 +349,7 @@ pub(super) struct PreparedDuckLakeTableBatch {
     first_sequence_key: Option<EventSequenceKey>,
     last_sequence_key: Option<EventSequenceKey>,
     insert_column_names: Vec<String>,
+    variant_column_names: Vec<String>,
     action: PreparedDuckLakeTableBatchAction,
 }
 
@@ -843,6 +856,7 @@ pub(super) fn prepare_copy_table_batch(
         first_sequence_key: None,
         last_sequence_key: None,
         insert_column_names: replicated_column_names(replicated_table_schema),
+        variant_column_names: variant_column_names(replicated_table_schema),
         action: PreparedDuckLakeTableBatchAction::Mutation(vec![PreparedTableMutation::Upsert(
             prepare_copy_rows(replicated_table_schema, table_rows)?,
         )]),
@@ -865,6 +879,7 @@ pub(super) fn prepare_copy_complete_table_batch(
         first_sequence_key: None,
         last_sequence_key: None,
         insert_column_names: Vec::new(),
+        variant_column_names: Vec::new(),
         action: PreparedDuckLakeTableBatchAction::Mutation(Vec::new()),
     }
 }
@@ -886,6 +901,7 @@ pub(super) fn prepare_truncate_table_batch(
         first_sequence_key: tracked_truncates.first().map(TrackedTruncateEvent::sequence_key),
         last_sequence_key: tracked_truncates.last().map(TrackedTruncateEvent::sequence_key),
         insert_column_names: Vec::new(),
+        variant_column_names: Vec::new(),
         action: PreparedDuckLakeTableBatchAction::Truncate,
     }
 }
@@ -1183,6 +1199,7 @@ fn push_prepared_mutation_batch(
         first_sequence_key,
         last_sequence_key,
         insert_column_names: replicated_column_names(replicated_table_schema),
+        variant_column_names: variant_column_names(replicated_table_schema),
         action: PreparedDuckLakeTableBatchAction::Mutation(prepare_table_mutations(
             replicated_table_schema,
             mutations,
@@ -1776,22 +1793,66 @@ fn quoted_column_list(column_names: &[String]) -> String {
         .join(", ")
 }
 
+/// Builds the select list that declares the staging table from the target.
+///
+/// A `VARIANT` column becomes `JSON` in staging, because neither the appender
+/// nor Arrow can write a `VARIANT`, while both write text.
+fn staging_declaration_list(column_names: &[String], variant_columns: &[String]) -> String {
+    column_names
+        .iter()
+        .map(|column_name| {
+            let quoted = quote_identifier(column_name);
+            if variant_columns.contains(column_name) {
+                format!("cast({quoted} as json) as {quoted}")
+            } else {
+                quoted
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Builds the select list that reads staging back into the target table.
+///
+/// Only the two-step `VARCHAR -> JSON -> VARIANT` cast parses a document, and
+/// the staging column is already `JSON`, so one cast is left here.
+fn staging_select_list(column_names: &[String], variant_columns: &[String]) -> String {
+    column_names
+        .iter()
+        .map(|column_name| {
+            let quoted = quote_identifier(column_name);
+            if variant_columns.contains(column_name) {
+                format!("cast({quoted} as variant)")
+            } else {
+                quoted
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Reusable per-batch temp staging table for DuckLake upserts.
 struct ReusableStagingTable {
     table_name: DuckLakeTableName,
     staging_name: String,
     created: bool,
     insert_column_names: Vec<String>,
+    variant_column_names: Vec<String>,
 }
 
 impl ReusableStagingTable {
     /// Creates a fresh staging-table manager for one destination table.
-    fn new(table_name: &DuckLakeTableName, insert_column_names: Vec<String>) -> Self {
+    fn new(
+        table_name: &DuckLakeTableName,
+        insert_column_names: Vec<String>,
+        variant_column_names: Vec<String>,
+    ) -> Self {
         Self {
             table_name: table_name.clone(),
             staging_name: format!("__staging_{}", table_name.id()),
             created: false,
             insert_column_names,
+            variant_column_names,
         }
     }
 
@@ -1806,10 +1867,12 @@ impl ReusableStagingTable {
         self.load_rows(conn, prepared_rows)?;
 
         let column_list = quoted_column_list(&self.insert_column_names);
+        let select_list =
+            staging_select_list(&self.insert_column_names, &self.variant_column_names);
         let target_table = qualified_lake_table_name(&self.table_name);
         let staging_table = quote_identifier(&self.staging_name);
         let sql = format!(
-            "insert into {target_table} ({column_list}) select {column_list} from {staging_table};"
+            "insert into {target_table} ({column_list}) select {select_list} from {staging_table};"
         );
         conn.execute_batch(&sql).map_err(|err| {
             tracing::error!(error = %err, "error INSERT INTO");
@@ -1857,7 +1920,8 @@ impl ReusableStagingTable {
             *counts.entry(self.table_name.id()).or_default() += 1;
         }
 
-        let column_list = quoted_column_list(&self.insert_column_names);
+        let column_list =
+            staging_declaration_list(&self.insert_column_names, &self.variant_column_names);
         let target_table = qualified_lake_table_name(&self.table_name);
         conn.execute_batch(&format!(
             "create or replace temp table {staging_table} as
@@ -1964,8 +2028,11 @@ fn apply_table_batch(
         )
     })?;
 
-    let mut reusable_staging_table =
-        ReusableStagingTable::new(&batch.table_name, batch.insert_column_names.clone());
+    let mut reusable_staging_table = ReusableStagingTable::new(
+        &batch.table_name,
+        batch.insert_column_names.clone(),
+        batch.variant_column_names.clone(),
+    );
     let result = (|| -> EtlResult<()> {
         match &batch.action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared_mutations) => {
@@ -2433,6 +2500,7 @@ mod tests {
             first_sequence_key: None,
             last_sequence_key: None,
             insert_column_names: vec![],
+            variant_column_names: vec![],
             action: PreparedDuckLakeTableBatchAction::Mutation(vec![]),
         }
     }
@@ -2620,6 +2688,7 @@ mod tests {
             staging_name: "staging_arrow_copy".to_owned(),
             created: true,
             insert_column_names: vec!["id".to_owned(), "name".to_owned(), "created_at".to_owned()],
+            variant_column_names: Vec::new(),
         };
 
         staging_table.load_rows(&conn, &prepared_rows).unwrap();

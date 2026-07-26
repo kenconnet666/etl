@@ -374,14 +374,8 @@ pub(super) fn cell_to_sql_literal_ref(cell: &Cell) -> String {
 }
 
 /// Returns whether a cell must bypass the DuckDB appender path.
-///
-/// A JSON cell targets a `VARIANT` column, and only the two-step
-/// `VARCHAR -> JSON -> VARIANT` cast parses the document; handing DuckDB a
-/// plain string produces a VARIANT holding that string, whose subpaths all read
-/// back as null. The appender cannot express that cast, so the row goes through
-/// SQL.
 fn cell_requires_sql_literals(cell: &Cell) -> bool {
-    matches!(cell, Cell::Array(_) | Cell::Json(_))
+    matches!(cell, Cell::Array(_))
 }
 
 /// Serializes a row into a SQL `VALUES (...)` tuple.
@@ -418,9 +412,7 @@ fn cell_to_sql_literal(cell: Cell) -> String {
             format!("TIMESTAMPTZ '{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f%:z"))
         }
         Cell::Uuid(u) => format!("CAST({} AS UUID)", quote_literal(&u.to_string())),
-        Cell::Json(j) => {
-            format!("CAST(CAST({} AS JSON) AS VARIANT)", quote_literal(&j.to_string()))
-        }
+        Cell::Json(j) => format!("CAST({} AS JSON)", quote_literal(&j.to_string())),
         Cell::Bytes(b) => format!("from_hex('{}')", encode_hex(&b)),
         Cell::Array(arr) => array_cell_to_sql_literal(arr),
     }
@@ -863,16 +855,14 @@ mod tests {
 
         let prepared = prepare_copy_rows(&schema, rows).unwrap();
 
-        // A JSON document targets a VARIANT column, which needs an explicit
-        // two-step cast that only the SQL path can express.
+        // JSON columns skip the Arrow path, and staging accepts them as text, so
+        // the appender still carries the rows.
         match prepared {
-            PreparedRows::SqlLiterals(rows) => {
+            PreparedRows::Appender(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert!(rows[0].contains("CAST(CAST("));
-                assert!(rows[0].contains("AS VARIANT)"));
             }
-            PreparedRows::Appender(_) | PreparedRows::ArrowRecordBatch(_) => {
-                panic!("expected sql literal fallback")
+            PreparedRows::SqlLiterals(_) | PreparedRows::ArrowRecordBatch(_) => {
+                panic!("expected row appender fallback")
             }
         }
     }
