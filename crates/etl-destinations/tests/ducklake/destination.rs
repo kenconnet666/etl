@@ -116,17 +116,22 @@ fn make_replicated_table_schema(schema: &TableSchema) -> ReplicatedTableSchema {
 
 /// Opens a verification connection to the same DuckLake catalog.
 ///
+/// The data path is passed the way the destination passes it, without a `file://`
+/// prefix, because DuckLake records the plain path in the catalog and rejects an
+/// attach whose `DATA_PATH` does not match it byte for byte.
+///
 /// Returns `Err` when the catalog cannot be attached (e.g. DuckDB WAL
 /// checkpoint mismatch while another connection is still flushing).
 fn try_open_lake_conn(catalog: &Url, data: &Url) -> Result<Connection, duckdb::Error> {
     let conn = open_verification_connection();
     let catalog_attach_target = catalog_attach_target(catalog);
+    let data_path = if data.scheme() == "file" { data.path() } else { data.as_str() };
     conn.execute_batch(&format!(
         "{} ATTACH {} AS {} (DATA_PATH {});",
         ducklake_load_sql(),
         quote_literal(&format!("ducklake:{catalog_attach_target}")),
         quote_identifier("lake"),
-        quote_literal(data.as_str())
+        quote_literal(data_path)
     ))?;
     Ok(conn)
 }

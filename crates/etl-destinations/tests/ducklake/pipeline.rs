@@ -85,12 +85,15 @@ struct SimulatorDdlTypeRow {
 fn open_lake_conn(catalog: &Url, data: &Url) -> Connection {
     let conn = open_verification_connection();
     let catalog_attach_target = catalog_attach_target(catalog);
+    // The destination passes a local path without its `file://` prefix, and
+    // DuckLake compares `DATA_PATH` against the catalog byte for byte.
+    let data_path = if data.scheme() == "file" { data.path() } else { data.as_str() };
     conn.execute_batch(&format!(
         "{} attach {} as {} (data_path {});",
         ducklake_load_sql(),
         quote_literal(&format!("ducklake:{catalog_attach_target}")),
         quote_identifier("lake"),
-        quote_literal(data.as_str())
+        quote_literal(data_path)
     ))
     .expect("failed to attach DuckLake catalog");
 
