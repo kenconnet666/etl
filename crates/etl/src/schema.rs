@@ -849,10 +849,7 @@ mod tests {
 
         let renamed = &diff.columns_to_change[0];
         assert_eq!(renamed.ordinal_position, 2);
-        assert!(matches!(
-            renamed.modifications.as_slice(),
-            [ColumnModification::Rename { .. }]
-        ));
+        assert!(matches!(renamed.modifications.as_slice(), [ColumnModification::Rename { .. }]));
 
         let retyped = &diff.columns_to_change[1];
         assert_eq!(retyped.ordinal_position, 3);
