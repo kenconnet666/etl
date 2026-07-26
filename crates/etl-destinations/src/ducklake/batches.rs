@@ -1309,9 +1309,9 @@ impl PendingBatchEffect {
 
     /// Drains the pending effect into an optional delete followed by an insert.
     ///
-    /// `key_column_names` is [`Some`] when the identity columns can be compared,
-    /// which lets the delete match through a staging join instead of a predicate
-    /// list that grows one branch per row.
+    /// `key_column_names` is [`Some`] when the identity columns can be
+    /// compared, which lets the delete match through a staging join instead
+    /// of a predicate list that grows one branch per row.
     fn drain_into(
         &mut self,
         key_column_names: Option<&[String]>,
@@ -1410,9 +1410,7 @@ fn prepare_table_mutations(
                 let predicate = delete_predicate_from_row(replicated_table_schema, &delete_row)?;
                 let key_row = identity_key_row(replicated_table_schema, &delete_row)?;
                 match new_row {
-                    UpdatedTableRow::Full(row) => {
-                        effect.set(predicate, key_row, true, Some(row))
-                    }
+                    UpdatedTableRow::Full(row) => effect.set(predicate, key_row, true, Some(row)),
                     UpdatedTableRow::Partial(partial_row) => {
                         // A partial update leaves the columns the source did not
                         // send untouched, so it cannot be expressed as a whole
@@ -1436,7 +1434,6 @@ fn prepare_table_mutations(
     Ok(prepared_mutations)
 }
 
-
 /// Returns the identity column values of `row`, in identity column order.
 fn identity_key_row<'a>(
     replicated_table_schema: &'a ReplicatedTableSchema,
@@ -1450,7 +1447,8 @@ fn identity_key_row<'a>(
 /// Returns the replica-identity column values stored in `row`.
 ///
 /// A full row image carries every replicated column, so the identity values are
-/// picked out by ordinal position; a key image already carries only those values.
+/// picked out by ordinal position; a key image already carries only those
+/// values.
 fn identity_key_values<'a>(
     replicated_table_schema: &'a ReplicatedTableSchema,
     row: impl Into<DeletePredicateRowRef<'a>>,
@@ -1463,7 +1461,7 @@ fn identity_key_values<'a>(
     if identity_column_schemas.is_empty() {
         return Err(etl_error!(
             ErrorKind::SourceReplicaIdentityError,
-            "DuckLake table has no replica identity columns",
+            "DuckLake delete requires a replica identity",
             format!(
                 "Table '{}' cannot locate rows without a replica identity",
                 replicated_table_schema.name()
@@ -2497,12 +2495,11 @@ fn flush_appender(
     })
 }
 
-
 /// Removes rows whose identity matches one of `key_rows`.
 ///
 /// The keys are staged and matched with a join, because a predicate list grows
-/// one branch per row and cannot use column statistics to skip files. Measured on
-/// the local stack, the predicate form costs about 0.42 ms per row against
+/// one branch per row and cannot use column statistics to skip files. Measured
+/// on the local stack, the predicate form costs about 0.42 ms per row against
 /// 0.031 ms for an insert of the same width.
 fn apply_delete_by_staged_keys(
     conn: &duckdb::Connection,
@@ -3278,9 +3275,17 @@ mod tests {
 
         assert_eq!(prepared.len(), 2);
         match &prepared[0] {
-            PreparedTableMutation::Delete { predicates, origin } => {
-                assert_eq!(predicates, &vec!["\"id\" = 1".to_owned()]);
+            PreparedTableMutation::Delete { keys, origin } => {
                 assert_eq!(origin, &"collapsed");
+                match keys {
+                    DeleteKeys::Rows { column_names, rows } => {
+                        assert_eq!(column_names, &vec!["id".to_owned()]);
+                        assert_eq!(rows.len(), 1);
+                    }
+                    DeleteKeys::Predicates(_) => {
+                        panic!("expected staged key rows for a comparable identity")
+                    }
+                }
             }
             PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
                 panic!("expected delete first")
@@ -3598,12 +3603,17 @@ mod tests {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
                 assert_eq!(prepared.len(), 1);
                 match &prepared[0] {
-                    PreparedTableMutation::Delete { predicates, origin } => {
+                    PreparedTableMutation::Delete { keys, origin } => {
                         assert_eq!(origin, &"collapsed");
-                        assert_eq!(
-                            predicates,
-                            &vec!["\"id\" = 1".to_owned(), "\"id\" = 2".to_owned()]
-                        );
+                        match keys {
+                            DeleteKeys::Rows { column_names, rows } => {
+                                assert_eq!(column_names, &vec!["id".to_owned()]);
+                                assert_eq!(rows.len(), 2);
+                            }
+                            DeleteKeys::Predicates(_) => {
+                                panic!("expected staged key rows for a comparable identity")
+                            }
+                        }
                     }
                     PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
                         panic!("expected delete batch")
@@ -3663,9 +3673,9 @@ mod tests {
                 // keys followed by one insert of both new rows.
                 assert_eq!(prepared.len(), 2);
                 match &prepared[0] {
-                    PreparedTableMutation::Delete { predicates, origin } => {
+                    PreparedTableMutation::Delete { keys, origin } => {
                         assert_eq!(origin, &"collapsed");
-                        assert_eq!(predicates.len(), 2);
+                        assert_eq!(keys.len(), 2);
                     }
                     PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
                         panic!("expected a collapsed delete first")
@@ -3708,8 +3718,8 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
-                PreparedTableMutation::Delete { predicates, .. } => {
-                    assert_eq!(predicates.len(), CDC_MUTATION_BATCH_SIZE);
+                PreparedTableMutation::Delete { keys, .. } => {
+                    assert_eq!(keys.len(), CDC_MUTATION_BATCH_SIZE);
                 }
                 PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
                     panic!("expected delete batch")
@@ -3720,8 +3730,8 @@ mod tests {
 
         match &batches[1].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
-                PreparedTableMutation::Delete { predicates, .. } => {
-                    assert_eq!(predicates.len(), 1);
+                PreparedTableMutation::Delete { keys, .. } => {
+                    assert_eq!(keys.len(), 1);
                 }
                 PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
                     panic!("expected delete batch")

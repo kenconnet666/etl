@@ -183,12 +183,12 @@ pub struct DuckLakeDestination<S> {
     store: S,
     /// Cache of table names whose DDL has already been executed.
     created_tables: Arc<Mutex<HashSet<DuckLakeTableName>>>,
-    /// Destination table name per source table, for tables known to exist and to
-    /// have their schema applied.
+    /// Destination table name per source table, for tables known to exist and
+    /// to have their schema applied.
     ///
-    /// Resolving a table name otherwise reads destination metadata from the state
-    /// store, which is a round trip per batch. An entry is removed whenever the
-    /// table is dropped, renamed, or enters a schema change.
+    /// Resolving a table name otherwise reads destination metadata from the
+    /// state store, which is a round trip per batch. An entry is removed
+    /// whenever the table is dropped, renamed, or enters a schema change.
     ready_table_names: Arc<Mutex<HashMap<TableId, DuckLakeTableName>>>,
     /// Cache tracking whether the ETL batch marker table already exists. If
     /// it's set then the table has already been created
@@ -493,24 +493,21 @@ struct TableMutationSegment {
     mutations: Vec<TrackedTableMutation>,
 }
 
-
 /// Records how long one preparatory stage of a table copy took.
-fn timed_copy_stage<F>(stage: &'static str, future: F) -> impl Future<Output = F::Output>
+async fn timed_copy_stage<F>(stage: &'static str, future: F) -> F::Output
 where
     F: Future,
 {
-    async move {
-        let started = Instant::now();
-        let output = future.await;
-        histogram!(
-            ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
-            BATCH_KIND_LABEL => "copy_prepare",
-            STAGE_LABEL => stage,
-        )
-        .record(started.elapsed().as_secs_f64());
+    let started = Instant::now();
+    let output = future.await;
+    histogram!(
+        ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
+        BATCH_KIND_LABEL => "copy_prepare",
+        STAGE_LABEL => stage,
+    )
+    .record(started.elapsed().as_secs_f64());
 
-        output
-    }
+    output
 }
 
 /// Returns whether two replicated schemas have the same row shape and identity.

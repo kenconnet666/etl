@@ -5,6 +5,14 @@ use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
 static REGISTER_METRICS: Once = Once::new();
 
 pub(crate) const ETL_TABLES_TOTAL: &str = "etl_tables_total";
+/// Time spent in one stage of the apply loop.
+///
+/// The stages partition where a replication message's time goes: waiting for
+/// the next message to arrive, decoding it into an event, and flushing a batch
+/// to the destination. Comparing them shows whether throughput is bounded by
+/// the source, by decoding, or by the destination.
+pub(crate) const ETL_APPLY_LOOP_STAGE_DURATION_SECONDS: &str =
+    "etl_apply_loop_stage_duration_seconds";
 pub(crate) const ETL_BATCH_ITEMS_SEND_DURATION_SECONDS: &str =
     "etl_batch_items_send_duration_seconds";
 pub(crate) const ETL_TRANSACTION_DURATION_SECONDS: &str = "etl_transaction_duration_seconds";
@@ -62,6 +70,7 @@ pub(crate) const EVENT_TYPE_LABEL: &str = "event_type";
 pub(crate) const FORCED_LABEL: &str = "forced";
 /// Label key for the status update type.
 pub(crate) const STATUS_UPDATE_TYPE_LABEL: &str = "status_update_type";
+pub(crate) const APPLY_STAGE_LABEL: &str = "stage";
 /// Label key for the DDL command tag emitted by Postgres.
 pub(crate) const COMMAND_TAG_LABEL: &str = "command_tag";
 /// Label key for the outcome of an operation.
@@ -78,6 +87,11 @@ pub(crate) fn register_metrics() {
     REGISTER_METRICS.call_once(|| {
         describe_gauge!(ETL_TABLES_TOTAL, Unit::Count, "Total number of tables being copied");
 
+        describe_histogram!(
+            ETL_APPLY_LOOP_STAGE_DURATION_SECONDS,
+            Unit::Seconds,
+            "Time spent in one stage of the apply loop, labeled by worker_type and stage."
+        );
         describe_histogram!(
             ETL_BATCH_ITEMS_SEND_DURATION_SECONDS,
             Unit::Seconds,

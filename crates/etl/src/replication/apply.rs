@@ -51,9 +51,10 @@ use crate::{
     etl_error,
     event::{Event, RelationEvent},
     observability::{
-        ACTION_LABEL, COMMAND_TAG_LABEL, ETL_APPLY_LOOP_EFFECTIVE_FLUSH_LAG_BYTES,
-        ETL_APPLY_LOOP_END_TO_END_LAG_BYTES, ETL_APPLY_LOOP_FLUSH_LAG_BYTES,
-        ETL_APPLY_LOOP_RECEIVED_LAG_BYTES, ETL_BATCH_ITEMS_SEND_DURATION_SECONDS,
+        ACTION_LABEL, APPLY_STAGE_LABEL, COMMAND_TAG_LABEL,
+        ETL_APPLY_LOOP_EFFECTIVE_FLUSH_LAG_BYTES, ETL_APPLY_LOOP_END_TO_END_LAG_BYTES,
+        ETL_APPLY_LOOP_FLUSH_LAG_BYTES, ETL_APPLY_LOOP_RECEIVED_LAG_BYTES,
+        ETL_APPLY_LOOP_STAGE_DURATION_SECONDS, ETL_BATCH_ITEMS_SEND_DURATION_SECONDS,
         ETL_BYTES_PROCESSED_TOTAL, ETL_BYTES_RECEIVED_TOTAL, ETL_DDL_SCHEMA_CHANGE_COLUMNS,
         ETL_DDL_SCHEMA_CHANGES_TOTAL, ETL_EVENTS_PROCESSED_TOTAL, ETL_EVENTS_RECEIVED_TOTAL,
         ETL_REPLICATION_MESSAGES_TOTAL, ETL_ROW_SIZE_BYTES, ETL_SCHEMA_CLEANUP_ERRORS_TOTAL,
@@ -1262,13 +1263,18 @@ where
 
             // PRIORITY 5: Process incoming replication messages from PostgreSQL.
             // New WAL messages are only accepted while the loop is still actively ingesting.
-            maybe_message = events_stream.next(), if self.state.can_process_messages() => {
+            (maybe_message, waited) = Self::next_message_timed(events_stream.as_mut()),
+                if self.state.can_process_messages() =>
+            {
+                self.record_apply_stage("await_message", waited);
+                let decode_started = Instant::now();
                 self.handle_stream_message(
                     events_stream.as_mut(),
                     maybe_message,
                     replication_client,
                 )
                 .await?;
+                self.record_apply_stage("handle_message", decode_started.elapsed());
             }
 
             // PRIORITY 6: Emit a periodic status update once the computed keep alive deadline
@@ -1854,6 +1860,27 @@ where
         }
     }
 
+    /// Awaits the next replication message and reports how long that took.
+    #[allow(clippy::type_complexity)]
+    async fn next_message_timed(
+        mut events_stream: Pin<&mut BackpressureStream<EventsStream>>,
+    ) -> (Option<EtlResult<ReplicationMessage<LogicalReplicationMessage>>>, Duration) {
+        let started = Instant::now();
+        let message = events_stream.next().await;
+
+        (message, started.elapsed())
+    }
+
+    /// Records how long one apply-loop stage took.
+    fn record_apply_stage(&self, stage: &'static str, elapsed: Duration) {
+        histogram!(
+            ETL_APPLY_LOOP_STAGE_DURATION_SECONDS,
+            WORKER_TYPE_LABEL => self.worker_context.worker_type().as_str(),
+            APPLY_STAGE_LABEL => stage,
+        )
+        .record(elapsed.as_secs_f64());
+    }
+
     /// Handles a replication message and flushes the batch if necessary.
     async fn handle_replication_message_and_flush(
         &mut self,
@@ -1901,6 +1928,15 @@ where
     /// processed. The queued batch is then retried from
     /// [`Self::handle_flush_result`] when that in-flight flush resolves.
     async fn flush_batch(&mut self, reason: &str) -> EtlResult<()> {
+        let flush_started = Instant::now();
+        let result = self.flush_batch_inner(reason).await;
+        self.record_apply_stage("flush_batch", flush_started.elapsed());
+
+        result
+    }
+
+    /// Flushes the pending batch to the destination.
+    async fn flush_batch_inner(&mut self, reason: &str) -> EtlResult<()> {
         // If the batch is empty, we don't need to do anything.
         if !self.state.has_pending_batch() {
             return Ok(());

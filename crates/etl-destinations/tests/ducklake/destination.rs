@@ -117,8 +117,8 @@ fn make_replicated_table_schema(schema: &TableSchema) -> ReplicatedTableSchema {
 /// Opens a verification connection to the same DuckLake catalog.
 ///
 /// The data path is passed the way the destination passes it, without a `file://`
-/// prefix, because DuckLake records the plain path in the catalog and rejects an
-/// attach whose `DATA_PATH` does not match it byte for byte.
+/// prefix, because DuckLake records the plain path in the catalog and rejects
+/// an attach whose `DATA_PATH` does not match it byte for byte.
 ///
 /// Returns `Err` when the catalog cannot be attached (e.g. DuckDB WAL
 /// checkpoint mismatch while another connection is still flushing).
