@@ -6,9 +6,11 @@
 
 #[cfg(feature = "ducklake")]
 mod retry;
-#[cfg(feature = "ducklake")]
+#[cfg(any(feature = "doris", feature = "ducklake"))]
 mod sql;
 
+#[cfg(feature = "doris")]
+pub mod doris;
 #[cfg(feature = "ducklake")]
 pub mod ducklake;
 #[cfg(feature = "egress")]

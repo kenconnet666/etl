@@ -15,6 +15,7 @@ required-features = ["ducklake"]
 [features]
 default = ["ducklake"]
 any-destination = []
+doris = ["any-destination", "etl-destinations/doris"]
 ducklake = ["any-destination", "etl-destinations/ducklake", "etl-maintenance/ducklake"]
 egress = ["etl/egress", "etl-destinations/egress"]
 
@@ -38,6 +39,7 @@ sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "fmt"] }
+url = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemalloc-ctl = { workspace = true }

@@ -47,7 +47,7 @@ inside `crates/etl-replicator`, with `APP_`-prefixed environment overrides.
 
 ```bash
 cd crates/etl-replicator
-APP_ENVIRONMENT=local cargo run --release
+APP_ENVIRONMENT=dev cargo run --release
 ```
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the local stack, migrations, and tests.

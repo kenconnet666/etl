@@ -14,6 +14,17 @@ pub(super) async fn start(
     let _ = &store;
 
     match replicator_config.destination.kind() {
+        DestinationKind::Doris => {
+            #[cfg(feature = "doris")]
+            {
+                doris::start(replicator_config, store).await
+            }
+
+            #[cfg(not(feature = "doris"))]
+            {
+                Err(disabled_destination_error(DestinationKind::Doris))
+            }
+        }
         DestinationKind::Ducklake => {
             #[cfg(feature = "ducklake")]
             {
@@ -28,12 +39,71 @@ pub(super) async fn start(
     }
 }
 
-#[cfg(not(feature = "ducklake"))]
+#[cfg(not(all(feature = "ducklake", feature = "doris")))]
 fn disabled_destination_error(kind: DestinationKind) -> crate::error::ReplicatorError {
     crate::error::ReplicatorError::config(std::io::Error::other(format!(
         "Destination `{}` support is not compiled into this binary.",
         kind.as_str()
     )))
+}
+
+/// Doris destination startup.
+#[cfg(feature = "doris")]
+mod doris {
+    use etl::pipeline::Pipeline;
+    use etl_config::shared::{DestinationConfig, ReplicatorConfig};
+    use etl_destinations::doris::{DorisConfig, DorisDestination};
+    use secrecy::ExposeSecret;
+    use url::Url;
+
+    use super::super::{ReplicatorStore, pipeline};
+    use crate::error::{ReplicatorError, ReplicatorResult};
+
+    /// Starts the Doris destination pipeline.
+    pub(super) async fn start(
+        replicator_config: ReplicatorConfig,
+        store: ReplicatorStore,
+    ) -> ReplicatorResult<()> {
+        let pipeline_id = replicator_config.pipeline.id;
+
+        let DestinationConfig::Doris {
+            fe_http_url,
+            fe_mysql_host,
+            fe_mysql_port,
+            user,
+            password,
+            database,
+            stream_load_timeout_secs,
+        } = &replicator_config.destination
+        else {
+            return Err(ReplicatorError::config(std::io::Error::other(
+                "Expected Doris destination config",
+            )));
+        };
+
+        let fe_http_url = Url::parse(fe_http_url).map_err(|error| {
+            ReplicatorError::config(std::io::Error::other(format!(
+                "Doris fe_http_url is not a valid URL: {error}"
+            )))
+        })?;
+        let doris_config = DorisConfig {
+            fe_http_url,
+            fe_mysql_host: fe_mysql_host.clone(),
+            fe_mysql_port: *fe_mysql_port,
+            user: user.clone(),
+            password: password.expose_secret().to_owned(),
+            database: database.clone(),
+            stream_load_timeout_secs: stream_load_timeout_secs
+                .unwrap_or(DorisConfig::DEFAULT_STREAM_LOAD_TIMEOUT_SECS),
+            schema_change_timeout_secs: DorisConfig::DEFAULT_SCHEMA_CHANGE_TIMEOUT_SECS,
+            pipeline_id,
+        };
+
+        let destination = DorisDestination::new(doris_config, store.clone()).await?;
+
+        let pipeline = Pipeline::new(replicator_config.pipeline, store, destination);
+        pipeline::start(pipeline).await
+    }
 }
 
 /// DuckLake destination startup.
@@ -78,7 +148,12 @@ mod ducklake {
             maintenance_target_file_size,
             expire_snapshots_older_than,
             maintenance_mode,
-        } = &replicator_config.destination;
+        } = &replicator_config.destination
+        else {
+            return Err(ReplicatorError::config(std::io::Error::other(
+                "Expected DuckLake destination config",
+            )));
+        };
 
         let s3_config = match (s3_access_key_id, s3_secret_access_key) {
             (Some(access_key_id), Some(secret_access_key)) => Some(DucklakeS3Config {

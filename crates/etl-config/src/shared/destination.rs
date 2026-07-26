@@ -21,6 +21,8 @@ pub enum DuckLakeMaintenanceMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DestinationKind {
+    /// Doris destination.
+    Doris,
     /// DuckLake destination.
     Ducklake,
 }
@@ -29,6 +31,7 @@ impl DestinationKind {
     /// Returns the stable destination name used in metrics and tags.
     pub const fn as_str(self) -> &'static str {
         match self {
+            DestinationKind::Doris => "doris",
             DestinationKind::Ducklake => "ducklake",
         }
     }
@@ -44,6 +47,22 @@ impl DestinationKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestinationConfig {
+    Doris {
+        /// Doris FE HTTP URL for Stream Load.
+        fe_http_url: String,
+        /// Doris FE MySQL protocol host.
+        fe_mysql_host: String,
+        /// Doris FE MySQL protocol port.
+        fe_mysql_port: u16,
+        /// Doris user name.
+        user: String,
+        /// Doris password.
+        password: SecretString,
+        /// Target Doris database.
+        database: String,
+        /// Optional Stream Load timeout in seconds.
+        stream_load_timeout_secs: Option<u64>,
+    },
     Ducklake {
         /// DuckLake catalog URL.
         catalog_url: SecretString,
@@ -83,6 +102,7 @@ impl DestinationConfig {
     /// Returns the destination kind represented by this config.
     pub fn kind(&self) -> DestinationKind {
         match self {
+            DestinationConfig::Doris { .. } => DestinationKind::Doris,
             DestinationConfig::Ducklake { .. } => DestinationKind::Ducklake,
         }
     }
@@ -94,6 +114,20 @@ impl DestinationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestinationConfigWithoutSecrets {
+    Doris {
+        /// Doris FE HTTP URL for Stream Load.
+        fe_http_url: String,
+        /// Doris FE MySQL protocol host.
+        fe_mysql_host: String,
+        /// Doris FE MySQL protocol port.
+        fe_mysql_port: u16,
+        /// Doris user name.
+        user: String,
+        /// Target Doris database.
+        database: String,
+        /// Optional Stream Load timeout in seconds.
+        stream_load_timeout_secs: Option<u64>,
+    },
     Ducklake {
         /// DuckLake data path.
         data_path: String,
@@ -123,6 +157,22 @@ pub enum DestinationConfigWithoutSecrets {
 impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
     fn from(value: DestinationConfig) -> Self {
         match value {
+            DestinationConfig::Doris {
+                fe_http_url,
+                fe_mysql_host,
+                fe_mysql_port,
+                user,
+                password: _,
+                database,
+                stream_load_timeout_secs,
+            } => DestinationConfigWithoutSecrets::Doris {
+                fe_http_url,
+                fe_mysql_host,
+                fe_mysql_port,
+                user,
+                database,
+                stream_load_timeout_secs,
+            },
             DestinationConfig::Ducklake {
                 catalog_url: _,
                 data_path,
@@ -184,7 +234,29 @@ mod tests {
     }
 
     #[test]
+    fn doris_without_secrets_omits_password() {
+        let config = DestinationConfig::Doris {
+            fe_http_url: "http://localhost:8030".to_owned(),
+            fe_mysql_host: "localhost".to_owned(),
+            fe_mysql_port: 9030,
+            user: "root".to_owned(),
+            password: "secret123".to_owned().into(),
+            database: "test_db".to_owned(),
+            stream_load_timeout_secs: None,
+        };
+
+        let without_secrets = DestinationConfigWithoutSecrets::from(config);
+        let json = serde_json::to_value(without_secrets).unwrap();
+        let serialized = json.to_string();
+
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("secret123"));
+        assert!(serialized.contains("localhost"));
+    }
+
+    #[test]
     fn destination_kind_names_match_metrics_labels() {
+        assert_eq!(DestinationKind::Doris.as_str(), "doris");
         assert_eq!(DestinationKind::Ducklake.as_str(), "ducklake");
     }
 }

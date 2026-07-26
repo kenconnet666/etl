@@ -302,12 +302,59 @@ pub(super) fn build_table_rename_sql_ducklake(
     ]
 }
 
-/// Builds the statements that change a DuckLake column type.
+/// Returns the DuckLake statement that promotes a column type in place, when
+/// DuckLake accepts the change as a lossless promotion.
 ///
-/// DuckLake rejects an in-place `alter column ... set data type`, so the column
-/// is rewritten through a temporary column. Only add, update, drop, and rename
-/// are used, which DuckLake supports, and the whole sequence runs inside the
-/// caller's DDL transaction so a failure leaves the table untouched.
+/// DuckLake only rewrites the catalog for a promotion and leaves data files
+/// untouched, relying on field-id remapping to cast on read. Anything outside
+/// the documented promotion set must go through
+/// [`build_column_retype_sql_ducklake`] instead.
+///
+/// See <https://ducklake.select/docs/stable/duckdb/usage/schema_evolution>.
+pub(super) fn build_column_type_promotion_sql_ducklake(
+    table_name: &DuckLakeTableName,
+    column_schema: &ColumnSchema,
+    old_ducklake_type: &str,
+) -> Option<String> {
+    let new_ducklake_type =
+        postgres_column_type_to_ducklake_sql(&column_schema.typ, column_schema.modifier);
+    if !is_ducklake_type_promotion(old_ducklake_type, &new_ducklake_type) {
+        return None;
+    }
+
+    let qualified_name = qualified_lake_table_name(table_name);
+    let column_name = quote_identifier(&column_schema.name);
+
+    Some(format!("alter table {qualified_name} alter {column_name} set type {new_ducklake_type}"))
+}
+
+/// Returns whether DuckLake treats a type change as a lossless promotion.
+fn is_ducklake_type_promotion(old_ducklake_type: &str, new_ducklake_type: &str) -> bool {
+    /// Promotions DuckLake accepts, expressed in the type names this module
+    /// generates.
+    const PROMOTIONS: [(&str, &[&str]); 7] = [
+        ("tinyint", &["smallint", "integer", "bigint"]),
+        ("smallint", &["integer", "bigint"]),
+        ("integer", &["bigint"]),
+        ("utinyint", &["usmallint", "uinteger", "ubigint"]),
+        ("usmallint", &["uinteger", "ubigint"]),
+        ("uinteger", &["ubigint"]),
+        ("float", &["double"]),
+    ];
+
+    PROMOTIONS.iter().any(|(source, targets)| {
+        *source == old_ducklake_type && targets.contains(&new_ducklake_type)
+    })
+}
+
+/// Builds the statements that change a DuckLake column type by rewriting it.
+///
+/// DuckLake accepts only lossless promotions in place, so every other change,
+/// such as `decimal(10, 2)` to `decimal(20, 4)` or a fallback `varchar`
+/// becoming a `bigint`, is applied by adding a temporary column, casting into
+/// it, dropping the original, and renaming. Only add, update, drop, and rename
+/// are used, and the whole sequence runs inside the caller's DDL transaction so
+/// a failure leaves the table untouched.
 pub(super) fn build_column_retype_sql_ducklake(
     table_name: &DuckLakeTableName,
     column_schema: &ColumnSchema,

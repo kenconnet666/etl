@@ -74,10 +74,11 @@ use crate::ducklake::{
     },
     schema::{
         build_add_column_sql_ducklake, build_column_retype_sql_ducklake,
-        build_create_table_sql_ducklake, build_drop_column_sql_ducklake,
-        build_drop_default_sql_ducklake, build_rename_column_sql_ducklake,
-        build_set_default_sql_ducklake, build_table_rename_sql_ducklake,
-        postgres_column_type_to_ducklake_sql, supports_column_default_ducklake,
+        build_column_type_promotion_sql_ducklake, build_create_table_sql_ducklake,
+        build_drop_column_sql_ducklake, build_drop_default_sql_ducklake,
+        build_rename_column_sql_ducklake, build_set_default_sql_ducklake,
+        build_table_rename_sql_ducklake, postgres_column_type_to_ducklake_sql,
+        supports_column_default_ducklake,
     },
     sql::qualified_lake_table_name,
 };
@@ -741,9 +742,21 @@ fn plan_schema_diff_sql_ducklake(
                         continue;
                     }
 
-                    // DuckLake does not support changing a column type in
-                    // place, so the column is rewritten through a temporary
-                    // column that only uses add, update, drop, and rename.
+                    // DuckLake applies a lossless promotion by rewriting only
+                    // the catalog, so prefer it and fall back to a full column
+                    // rewrite for every other change.
+                    if let Some(sql) = build_column_type_promotion_sql_ducklake(
+                        table_name,
+                        &change.new_column,
+                        &old_ducklake_type,
+                    ) {
+                        statements.push(DuckLakeSchemaDdlStatement {
+                            sql,
+                            error_description: "DuckLake column type promotion failed",
+                        });
+                        continue;
+                    }
+
                     let retype_name =
                         format!("{DUCKLAKE_RETYPE_COLUMN_PREFIX}{}", change.new_column.name);
                     for sql in build_column_retype_sql_ducklake(

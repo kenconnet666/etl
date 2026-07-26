@@ -1647,9 +1647,9 @@ fn query_ducklake_column_type(
     column_name: &str,
 ) -> (String, String) {
     let sql = format!(
-        "select data_type, is_nullable from {}.information_schema.columns where table_schema = {} \
-         and table_name = {} and column_name = {}",
-        quote_identifier("lake"),
+        "select data_type, is_nullable from information_schema.columns where table_catalog = {} \
+         and table_schema = {} and table_name = {} and column_name = {}",
+        quote_literal("lake"),
         quote_literal(table_name.schema()),
         quote_literal(table_name.table()),
         quote_literal(column_name)

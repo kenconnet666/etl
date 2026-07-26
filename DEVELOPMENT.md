@@ -122,7 +122,7 @@ Configuration loads in three layers: `configuration/base.yaml`, then
 
 ```bash
 cd crates/etl-replicator
-APP_ENVIRONMENT=local cargo run --release
+APP_ENVIRONMENT=dev cargo run --release
 ```
 
 The Docker image needs both configuration files mounted:
@@ -130,8 +130,8 @@ The Docker image needs both configuration files mounted:
 ```bash
 docker run \
   -v $(pwd)/crates/etl-replicator/configuration/base.yaml:/app/configuration/base.yaml \
-  -v $(pwd)/crates/etl-replicator/configuration/local.yaml:/app/configuration/local.yaml \
-  -e APP_ENVIRONMENT=local \
+  -v $(pwd)/crates/etl-replicator/configuration/dev.yaml:/app/configuration/dev.yaml \
+  -e APP_ENVIRONMENT=dev \
   etl-replicator:latest
 ```
 

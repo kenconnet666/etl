@@ -55,7 +55,10 @@ async fn run(config: ReplicatorConfig) -> MaintenanceResult<()> {
         maintenance_target_file_size,
         expire_snapshots_older_than,
         ..
-    } = config.destination;
+    } = config.destination
+    else {
+        return Err("etl-ducklake-maintenance requires a DuckLake destination".into());
+    };
 
     let s3 = match (s3_access_key_id, s3_secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => Some(DuckLakeS3Config {
