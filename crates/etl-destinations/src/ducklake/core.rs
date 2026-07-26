@@ -2,8 +2,9 @@
 use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use etl::{
@@ -23,7 +24,7 @@ use etl::{
     store::{DestinationStore, TableStateType},
 };
 use etl_config::ducklake_catalog_metadata_connect_options;
-use metrics::gauge;
+use metrics::{gauge, histogram};
 use parking_lot::Mutex;
 use pg_escape::{quote_identifier as quote_postgres_identifier, quote_literal};
 use sqlx::{AssertSqlSafe, PgPool, postgres::PgPoolOptions};
@@ -64,7 +65,8 @@ use crate::ducklake::{
     external_maintenance::ExternalMaintenanceOperations,
     inline_size::DuckLakePendingInlineSizeSampler,
     metrics::{
-        DuckLakeMetricsSampler, ETL_DUCKLAKE_POOL_SIZE, query_catalog_maintenance_metrics,
+        BATCH_KIND_LABEL, DuckLakeMetricsSampler, ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
+        ETL_DUCKLAKE_POOL_SIZE, STAGE_LABEL, query_catalog_maintenance_metrics,
         query_table_storage_metrics, register_metrics, resolve_ducklake_metadata_schema_blocking,
         spawn_ducklake_metrics_sampler,
     },
@@ -181,6 +183,13 @@ pub struct DuckLakeDestination<S> {
     store: S,
     /// Cache of table names whose DDL has already been executed.
     created_tables: Arc<Mutex<HashSet<DuckLakeTableName>>>,
+    /// Destination table name per source table, for tables known to exist and to
+    /// have their schema applied.
+    ///
+    /// Resolving a table name otherwise reads destination metadata from the state
+    /// store, which is a round trip per batch. An entry is removed whenever the
+    /// table is dropped, renamed, or enters a schema change.
+    ready_table_names: Arc<Mutex<HashMap<TableId, DuckLakeTableName>>>,
     /// Cache tracking whether the ETL batch marker table already exists. If
     /// it's set then the table has already been created
     applied_batches_table_created: Arc<AtomicBool>,
@@ -482,6 +491,26 @@ struct TableMutationSegment {
     replicated_table_schema: ReplicatedTableSchema,
     /// Ordered mutations for the schema.
     mutations: Vec<TrackedTableMutation>,
+}
+
+
+/// Records how long one preparatory stage of a table copy took.
+fn timed_copy_stage<F>(stage: &'static str, future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    async move {
+        let started = Instant::now();
+        let output = future.await;
+        histogram!(
+            ETL_DUCKLAKE_BATCH_STAGE_DURATION_SECONDS,
+            BATCH_KIND_LABEL => "copy_prepare",
+            STAGE_LABEL => stage,
+        )
+        .record(started.elapsed().as_secs_f64());
+
+        output
+    }
 }
 
 /// Returns whether two replicated schemas have the same row shape and identity.
@@ -1287,6 +1316,7 @@ where
 
         let copy_pool = Arc::new(build_warm_ducklake_pool(copy_manager, pool_size, "copy").await?);
         let created_tables = Arc::default();
+        let ready_table_names: Arc<Mutex<HashMap<TableId, DuckLakeTableName>>> = Arc::default();
         let checkpoint_gate = Arc::new(RwLock::new(()));
         let mut destination = Self {
             manager: Arc::clone(&manager),
@@ -1305,6 +1335,7 @@ where
             table_write_slots: Arc::default(),
             store,
             created_tables: Arc::clone(&created_tables),
+            ready_table_names: Arc::clone(&ready_table_names),
             applied_batches_table_created,
             streaming_progress_table_created,
         };
@@ -1483,6 +1514,9 @@ where
         );
 
         self.created_tables.lock().remove(&table_name);
+        // The source table this destination table belonged to is copying again, so
+        // the cached name must not survive the drop.
+        self.ready_table_names.lock().retain(|_, cached| cached != &table_name);
 
         Ok(())
     }
@@ -1504,13 +1538,21 @@ where
         replicated_table_schema: &ReplicatedTableSchema,
         table_rows: Vec<TableRow>,
     ) -> EtlResult<()> {
-        let table_name = self.ensure_table_exists(replicated_table_schema).await?;
+        // The copy path spends most of a small table's wall clock outside the
+        // write itself, so each preparatory step is timed separately.
+        let table_name =
+            timed_copy_stage("ensure_table", self.ensure_table_exists(replicated_table_schema))
+                .await?;
 
         // Copy batches for the same table must still serialize so concurrent
         // callers do not race each other inside DuckDB.
-        self.ensure_applied_batches_table_exists().await?;
-        let _table_write_permit = self.acquire_table_write_slot(&table_name).await?;
-        let replay_epoch = self.read_table_replay_epoch(&table_name).await?;
+        timed_copy_stage("ensure_marker_table", self.ensure_applied_batches_table_exists()).await?;
+        let _table_write_permit =
+            timed_copy_stage("table_write_slot", self.acquire_table_write_slot(&table_name))
+                .await?;
+        let replay_epoch =
+            timed_copy_stage("read_replay_epoch", self.read_table_replay_epoch(&table_name))
+                .await?;
         let _checkpoint_guard = self.acquire_mutation_guard().await;
         let prepared_batch = if table_rows.is_empty() {
             prepare_copy_complete_table_batch(table_name, replay_epoch)
@@ -1619,6 +1661,9 @@ where
             DestinationTableSchemaStatus::Applying,
         );
         self.store.store_destination_table_metadata(table_id, updated_metadata.clone()).await?;
+        // The table is mid-schema-change now, so its cached name must not let a
+        // writer skip the metadata read that detects that state.
+        self.ready_table_names.lock().remove(&table_id);
 
         let diff = current_schema.diff(new_replicated_table_schema);
         if let Err(error) = self.apply_schema_diff(&table_name, &diff).await {
@@ -1747,6 +1792,7 @@ where
         {
             let mut created_tables = self.created_tables.lock();
             created_tables.remove(current_table_name);
+            self.ready_table_names.lock().remove(&table_id);
             created_tables.insert(new_table_name.clone());
         }
 
@@ -2548,6 +2594,10 @@ where
         replicated_table_schema: &ReplicatedTableSchema,
     ) -> EtlResult<DuckLakeTableName> {
         let table_id = replicated_table_schema.id();
+        if let Some(table_name) = self.ready_table_names.lock().get(&table_id).cloned() {
+            return Ok(table_name);
+        }
+
         let metadata = self.store.get_destination_table_metadata(table_id).await?;
         let table_name = metadata.as_ref().map_or_else(
             || table_name_to_ducklake_table_name(replicated_table_schema.name()),
@@ -2557,6 +2607,7 @@ where
         if !metadata.as_ref().is_some_and(DestinationTableMetadata::is_applying)
             && self.created_tables.lock().contains(&table_name)
         {
+            self.ready_table_names.lock().insert(table_id, table_name.clone());
             return Ok(table_name);
         }
 
@@ -2580,6 +2631,7 @@ where
         if !metadata.as_ref().is_some_and(DestinationTableMetadata::is_applying)
             && self.created_tables.lock().contains(&table_name)
         {
+            self.ready_table_names.lock().insert(table_id, table_name.clone());
             return Ok(table_name);
         }
 
