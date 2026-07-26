@@ -80,6 +80,12 @@ roughly 25,000 rows/s, because a fixed cost of about 1.5 s per scenario — the
 batch fill window, connection setup, and the benchmark's own polling granularity
 — is 40% of the total there and 4% here. Compare figures at the same row count.
 
+Streaming inserts are within 3% of what the source can deliver: draining the same
+rows from an equivalent slot with `pg_recvlogical` into `/dev/null`, with no row
+decoding and no destination, reaches 38,630 rows/s against the 37,601 above. Going
+materially faster requires several replication slots decoding in parallel rather
+than changes to this code.
+
 `scripts/bin/bench-replica.sh` reproduces these numbers, and
 [DEVELOPMENT.md](DEVELOPMENT.md) documents the measurement scope, the known gaps,
 and the local environment traps that distort results.

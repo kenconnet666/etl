@@ -235,25 +235,26 @@ The fixed cost is the batch fill window, connection setup, and the benchmark's
 own polling granularity. It dominates at 100,000 rows and fades at 1,000,000,
 which is why a figure is only comparable against another at the same row count.
 
-**The destination is no longer the bottleneck.** Over the 1,000,000-row run the
-`upsert` stage wrote 3,000,039 rows across 210 calls at 83 ms each, about 5.8
-microseconds per row, and `delete` matched 2,000,012 keys across 137 calls at 78
-ms each, about 5.2 microseconds per key. That is roughly 170,000 rows/s of write
-capacity against measured end-to-end rates of 29,000 to 49,000. Two waits confirm
-it: `blocking_slot_wait` totalled 2.8 ms across 531 acquisitions and
-`pool_checkout_wait` 0.59 s, so the destination never queues for a resource — it
-waits for events to arrive.
+**Throughput is bounded by the source, not by this code.** Draining the same
+1,000,000 rows from an equivalent slot with `pg_recvlogical` straight into
+`/dev/null` — no row decoding, no destination — takes 25.9 s, or 38,630 rows/s.
+The full chain takes 26.6 s, or 37,601 rows/s, so it captures 97% of what the
+walsender can deliver on this machine.
 
-The batch size follows from that. Batches averaged 14,000 rows, which is the
-decode rate multiplied by the 500 ms fill window, and raising `max_bytes` from
-8 MB to 128 MB changed nothing measurable. A DuckLake commit costs about 28 ms and
-there were 227 of them, 6.4 s in total, so the commit count is real but small
-next to the 118 s the streaming scenarios took.
+Three earlier measurements line up behind that. The destination's `upsert` stage
+writes rows at about 5.8 microseconds each and `delete` matches keys at 5.2, which
+is roughly 170,000 rows/s of capacity. `blocking_slot_wait` totals 2.8 ms across
+531 acquisitions and `pool_checkout_wait` 0.59 s, so the destination never queues
+for a resource. And the apply loop spends 94 s awaiting messages against 38 s
+handling them — a ratio that did not move when draining buffered messages cut the
+loop's iteration count 18-fold, from 4,500,525 to 241,001.
 
-Further throughput therefore has to come from decode and transport in `etl`, not
-from the destination. For reference, the implementation this fork was compared
-against measures its own protocol ceiling at 153,000 to 163,000 rows/s while its
-full chain reaches 34,542, so it does not saturate decode either.
+So the remaining 3% is the whole optimisation budget on this path. Going
+materially faster needs the bottleneck moved off a single walsender, which means
+several replication slots decoding in parallel, sharded by table or schema. That
+is a deployment topology rather than a code change, and it costs roughly N times
+the source-side WAL decoding because every walsender decodes all of the WAL before
+filtering by publication.
 
 **The initial copy carries about 18 seconds that is still unattributed.** Its own
 table sync takes 4.4 s — the state log goes `init` to `data_sync` to `sync_done`
