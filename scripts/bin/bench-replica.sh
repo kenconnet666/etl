@@ -415,7 +415,7 @@ log "batch stage distribution"
 # where a batch spends its time instead of leaving it to guesswork.
 if command -v curl >/dev/null 2>&1; then
   curl -s http://127.0.0.1:9000/metrics 2>/dev/null \
-    | grep -E 'etl_ducklake_batch_stage_duration_seconds|etl_ducklake_(upsert_rows|delete_predicates)|etl_ducklake_pool_checkout_wait|etl_ducklake_blocking_slot_wait' \
+    | grep -E 'etl_apply_loop_stage_duration_seconds|etl_ducklake_batch_stage_duration_seconds|etl_ducklake_(upsert_rows|delete_predicates)|etl_ducklake_pool_checkout_wait|etl_ducklake_blocking_slot_wait|etl_events_processed_total|etl_bytes_processed_total' \
     | grep -vE '_bucket|^#' \
     | sed 's/etl_ducklake_//' \
     || echo "no stage metrics scraped"

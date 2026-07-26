@@ -20,7 +20,7 @@ use std::{
 };
 
 use etl_config::shared::PipelineConfig;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use metrics::{counter, gauge, histogram};
 use postgres_replication::{
     protocol,
@@ -51,7 +51,7 @@ use crate::{
     etl_error,
     event::{Event, RelationEvent},
     observability::{
-        ACTION_LABEL, APPLY_STAGE_LABEL, COMMAND_TAG_LABEL,
+        ACTION_LABEL, APPLY_STAGE_LABEL, COMMAND_TAG_LABEL, ETL_APPLY_LOOP_DRAINED_MESSAGES,
         ETL_APPLY_LOOP_EFFECTIVE_FLUSH_LAG_BYTES, ETL_APPLY_LOOP_END_TO_END_LAG_BYTES,
         ETL_APPLY_LOOP_FLUSH_LAG_BYTES, ETL_APPLY_LOOP_RECEIVED_LAG_BYTES,
         ETL_APPLY_LOOP_STAGE_DURATION_SECONDS, ETL_BATCH_ITEMS_SEND_DURATION_SECONDS,
@@ -220,6 +220,14 @@ pub(crate) enum WorkerContext<S, D> {
     /// Context for a table sync worker.
     TableSync(TableSyncWorkerContext<S>),
 }
+
+/// Maximum number of already-buffered replication messages handled without
+/// returning to the loop's `select!`.
+///
+/// Rebuilding the branch futures costs more than handling a message, so
+/// draining amortises it; the bound keeps shutdown, flush deadlines, and status
+/// updates responsive.
+const MAX_DRAINED_MESSAGES_PER_ITERATION: usize = 1024;
 
 impl<S, D> WorkerContext<S, D> {
     /// Returns the [`WorkerType`] for this context.
@@ -1274,7 +1282,38 @@ where
                     replication_client,
                 )
                 .await?;
+
+                // Returning to the `select!` for every message means rebuilding
+                // ten branch futures per message, which dominated the loop at
+                // roughly 20 microseconds of wait per message. Messages already
+                // buffered on the socket are handled here instead, bounded so the
+                // other branches still get their turn.
+                let mut drained = 0;
+                while drained < MAX_DRAINED_MESSAGES_PER_ITERATION
+                    && self.state.can_process_messages()
+                {
+                    let Some(maybe_message) =
+                        events_stream.next().now_or_never()
+                    else {
+                        break;
+                    };
+
+                    drained += 1;
+                    self.handle_stream_message(
+                        events_stream.as_mut(),
+                        maybe_message,
+                        replication_client,
+                    )
+                    .await?;
+                }
                 self.record_apply_stage("handle_message", decode_started.elapsed());
+                if drained > 0 {
+                    histogram!(
+                        ETL_APPLY_LOOP_DRAINED_MESSAGES,
+                        WORKER_TYPE_LABEL => self.worker_context.worker_type().as_str(),
+                    )
+                    .record(drained as f64);
+                }
             }
 
             // PRIORITY 6: Emit a periodic status update once the computed keep alive deadline

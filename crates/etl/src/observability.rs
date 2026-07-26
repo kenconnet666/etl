@@ -11,6 +11,8 @@ pub(crate) const ETL_TABLES_TOTAL: &str = "etl_tables_total";
 /// the next message to arrive, decoding it into an event, and flushing a batch
 /// to the destination. Comparing them shows whether throughput is bounded by
 /// the source, by decoding, or by the destination.
+/// Replication messages handled in one apply-loop iteration beyond the first.
+pub(crate) const ETL_APPLY_LOOP_DRAINED_MESSAGES: &str = "etl_apply_loop_drained_messages";
 pub(crate) const ETL_APPLY_LOOP_STAGE_DURATION_SECONDS: &str =
     "etl_apply_loop_stage_duration_seconds";
 pub(crate) const ETL_BATCH_ITEMS_SEND_DURATION_SECONDS: &str =
