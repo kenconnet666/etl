@@ -221,37 +221,40 @@ These cost hours to rediscover:
 
 ### Where the time goes
 
-Measured on one machine with a local data path, comparing 5000 rows against
-100000 rows to separate the fixed cost from the per-row cost:
+Measured on one machine with a local data path. Comparing 100,000 rows against
+1,000,000 separates the fixed cost from the per-row cost:
 
-| Path | Per row | Fixed |
+| Path | Per row | Fixed per scenario |
 | --- | --- | --- |
-| Streaming insert | ~0.031 ms | ~1.3 s |
-| Warm update / delete | ~0.035 ms | ~1 s |
-| Initial copy | ~0.06 ms | ~18 s |
+| Streaming insert | ~0.021 ms | ~1.5 s |
+| Warm update | ~0.033 ms | ~1 s |
+| Warm delete | ~0.018 ms | ~1 s |
+| Initial copy | ~0.016 ms | ~18 s |
 
-Streaming inserts, updates, and deletes are all in the same range now, because a
-batch collapses by key into one delete matched through staged keys plus one
-insert. That is close to what the destination can absorb, and matches the
-reference implementation this fork was measured against.
+The fixed cost is the batch fill window, connection setup, and the benchmark's
+own polling granularity. It dominates at 100,000 rows and fades at 1,000,000,
+which is why a figure is only comparable against another at the same row count.
 
-**The initial copy is the one real gap.** Its own table sync takes about 4.4
-seconds — the state log goes `init` to `data_sync` to `sync_done` in that time —
-while the benchmark measures 19 seconds from replicator start to the destination
-matching. So roughly 14 seconds happen outside both the write path and the table
-sync worker. Ruled out so far: the number of tables (a single table measures the
-same), the batch fill window (a longer one changes nothing here), per-table write
-slot contention (20 batches wait 8.3 s in total but that overlaps with work), and
-serial connection pool warm-up (now parallel, with no effect on this figure).
-Worth checking next: process startup before the pipeline runs, source-side
-snapshot export and `COPY` throughput, and whether the benchmark's own polling
-still inflates it.
+Inside a batch the write itself is fast: the `upsert` stage averages 87 ms for
+about 15,000 rows, roughly 6 microseconds per row. A DuckLake commit costs about
+28 ms for a streaming batch, and the batch count multiplies that, but raising
+`max_bytes` from 8 MB to 128 MB changed nothing measurable, so the batch count is
+not what bounds throughput at this scale.
 
-Two smaller items: a DuckLake commit measures about 108 ms against roughly 23 ms
-for the reference implementation, cause not yet investigated; and
-`arrow_column_kinds` returns `None` for UUID, JSON, and JSONB, so one such column
-sends a whole table down the row-by-row appender path. Staging already carries
-JSON as text, so `Utf8` would match.
+**The initial copy carries about 18 seconds that is still unattributed.** Its own
+table sync takes 4.4 s — the state log goes `init` to `data_sync` to `sync_done`
+in that time — while the benchmark measures 19 s at 100,000 rows. Ruled out so
+far: the number of tables (a single table measures the same), the batch fill
+window (a longer one changes nothing here), per-table write slot contention
+(20 batches wait 8.3 s in total but that overlaps with work), and serial
+connection pool warm-up (now parallel, with no effect). Worth checking next:
+process startup before the pipeline runs, source-side snapshot export and `COPY`
+throughput, and whether the benchmark's polling still inflates it. At 1,000,000
+rows this cost is amortised and the copy reaches 29,670 rows/s.
+
+`arrow_column_kinds` also returns `None` for UUID, JSON, and JSONB, so one such
+column sends a whole table down the row-by-row appender path. Staging already
+carries JSON as text, so `Utf8` would match.
 
 ### Next steps, in order
 

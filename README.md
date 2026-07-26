@@ -62,19 +62,23 @@ than subtracted, so each figure is end to end.
 
 | Scenario | Rows | Source write | To the replica | Rows/s |
 | --- | --- | --- | --- | --- |
-| Initial copy, catching up a backlog | 100,000 | 835 ms | 19,381 ms | 5,159 |
-| Streaming insert | 100,000 | 913 ms | 3,758 ms | 26,609 |
-| Streaming insert, 4 tables | 75,000 | 906 ms | 2,831 ms | 26,492 |
-| Interleaved insert/update/delete | 50,000 | 2,354 ms | 3,326 ms | 15,033 |
-| Warm update | 100,000 | 881 ms | 3,884 ms | 25,746 |
-| Warm delete | 50,000 | 227 ms | 2,035 ms | 24,570 |
+| Initial copy, catching up a backlog | 1,000,000 | 7,428 ms | 33,703 ms | 29,670 |
+| Streaming insert | 1,000,000 | 8,393 ms | 27,451 ms | 36,428 |
+| Streaming insert, 4 tables | 750,000 | 6,087 ms | 16,360 ms | 45,843 |
+| Interleaved insert/update/delete | 500,000 | 22,495 ms | 29,949 ms | 16,695 |
+| Warm update | 1,000,000 | 9,787 ms | 34,119 ms | 29,309 |
+| Warm delete | 500,000 | 1,013 ms | 10,217 ms | 48,938 |
 
-Streaming throughput sits in the same range across inserts, updates, and
-deletes, because a batch collapses by key into one delete matched through staged
-keys plus one insert, whatever mix of operations it contains. The initial copy is
-the outlier: its own table sync finishes in about 4.4 seconds, so most of the
-figure above is startup work outside the write path that has not been attributed
-yet.
+Streaming throughput sits in the same range across inserts, updates, and deletes,
+because a batch collapses by key into one delete matched through staged keys plus
+one insert, whatever mix of operations it contains. The interleaved figure is
+lower mostly on the source side: generating it row by row in a PL/pgSQL loop
+takes 22 s of the 30 s.
+
+Scale matters when reading these. At 100,000 rows the same scenarios measure
+roughly 25,000 rows/s, because a fixed cost of about 1.5 s per scenario — the
+batch fill window, connection setup, and the benchmark's own polling granularity
+— is 40% of the total there and 4% here. Compare figures at the same row count.
 
 `scripts/bin/bench-replica.sh` reproduces these numbers, and
 [DEVELOPMENT.md](DEVELOPMENT.md) documents the measurement scope, the known gaps,
