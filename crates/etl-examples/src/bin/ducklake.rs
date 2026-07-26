@@ -34,7 +34,7 @@ use clap::{Args, Parser};
 use etl::{
     config::{
         BatchConfig, InvalidatedSlotBehavior, PgConnectionConfig, PipelineConfig,
-        TableSyncCopyConfig, TcpKeepaliveConfig, TlsConfig, parse_ducklake_s3_data_path,
+        TableSyncCopyConfig, TcpKeepaliveConfig, TlsConfig, parse_ducklake_data_path,
         parse_ducklake_url,
     },
     pipeline::Pipeline,
@@ -96,7 +96,7 @@ struct DuckLakeArgs {
     #[arg(long, value_parser = parse_ducklake_url)]
     catalog_url: Url,
     /// S3 / S3-compatible URI for Parquet files (e.g., s3://bucket/)
-    #[arg(long, value_parser = parse_ducklake_s3_data_path)]
+    #[arg(long, value_parser = parse_ducklake_data_path)]
     data_path: Url,
     /// DuckDB connection pool size
     #[arg(long, default_value = "4")]

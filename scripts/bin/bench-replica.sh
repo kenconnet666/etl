@@ -15,6 +15,9 @@
 #
 # Source write time is reported separately and is not subtracted, so a streaming
 # number is an end-to-end figure rather than a destination-only one.
+#
+# The lake writes through the local stack's S3 endpoint, so object-storage
+# round trips are included. Point LAKE_DATA_PATH elsewhere to change that.
 set -euo pipefail
 
 DESTINATION="${DESTINATION:-ducklake}"
@@ -23,6 +26,15 @@ TABLES="${TABLES:-4}"
 SOURCE_DSN="${SOURCE_DSN:-postgres://postgres:changeme@localhost:15432/postgres}"
 CATALOG_CONNINFO="${CATALOG_CONNINFO:-host=localhost port=15434 dbname=ducklake_catalog user=lake_admin password=changeme}"
 DUCKDB="${DUCKDB:-duckdb}"
+LAKE_DATA_PATH="${LAKE_DATA_PATH:-s3://lake/ducklake}"
+# S3 settings only apply to an s3:// data path.
+LAKE_IS_S3=0
+[[ "$LAKE_DATA_PATH" == s3://* ]] && LAKE_IS_S3=1
+LAKE_SECRET_SQL=""
+if [[ "$LAKE_IS_S3" -eq 1 ]]; then
+  LAKE_SECRET_SQL="create or replace secret lake_storage (type s3, key_id 'minioadmin',
+    secret 'minioadmin', endpoint 'localhost:19000', url_style 'path', use_ssl false);"
+fi
 PIPELINE_ID="${PIPELINE_ID:-9101}"
 PUBLICATION="${PUBLICATION:-etl_bench_pub}"
 TABLE_PREFIX="${TABLE_PREFIX:-bench_orders}"
@@ -65,11 +77,8 @@ dest_count() {
       install ducklake; load ducklake;
       install postgres; load postgres;
       install httpfs; load httpfs;
-      create or replace secret lake_storage (
-        type s3, key_id 'minioadmin', secret 'minioadmin',
-        endpoint 'localhost:19000', url_style 'path', use_ssl false
-      );
-      attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path 's3://lake/ducklake');
+      $LAKE_SECRET_SQL
+      attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path '$LAKE_DATA_PATH', override_data_path true);
       select 'N=' || cast(count(*) as varchar) from lake.public.\"$table\";
     " 2>/dev/null | sed -n 's/^N=//p' | tail -1
   else
@@ -116,11 +125,9 @@ throughput() {
 }
 
 start_replicator() {
-  local extra_env=()
-  if [[ "$DESTINATION" == "doris" ]]; then
-    extra_env=(APP_CONFIG_DIR="$CONFIG_DIR")
-  else
-    extra_env=(LD_LIBRARY_PATH="$DUCKDB_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+  local extra_env=(APP_CONFIG_DIR="$CONFIG_DIR")
+  if [[ "$DESTINATION" == "ducklake" ]]; then
+    extra_env+=(LD_LIBRARY_PATH="$DUCKDB_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
   fi
 
   env APP_ENVIRONMENT=dev \
@@ -184,6 +191,44 @@ log "building the replicator"
 if [[ "$DESTINATION" == "ducklake" ]]; then
   cargo build --release -p etl-replicator --features ducklake --bins
   DUCKDB_LIB_DIR="$(dirname "$(find "$TARGET_DIR" -name libduckdb.so -print -quit)")"
+  CONFIG_DIR="$TARGET_DIR/bench-ducklake-configuration"
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_DIR/base.yaml" <<YAML
+pipeline:
+  id: $PIPELINE_ID
+  publication_name: $PUBLICATION
+YAML
+  cat > "$CONFIG_DIR/dev.yaml" <<YAML
+pipeline:
+  id: $PIPELINE_ID
+  publication_name: $PUBLICATION
+  pg_connection:
+    host: localhost
+    port: 15432
+    name: postgres
+    username: postgres
+    password: changeme
+    tls:
+      enabled: false
+      trusted_root_certs: ""
+
+destination:
+  ducklake:
+    catalog_url: postgres://lake_admin:changeme@localhost:15434/ducklake_catalog
+    data_path: $LAKE_DATA_PATH
+    maintenance_mode: postgres
+YAML
+  if [[ "$LAKE_IS_S3" -eq 1 ]]; then
+    cat >> "$CONFIG_DIR/dev.yaml" <<YAML
+    s3_access_key_id: minioadmin
+    s3_secret_access_key: minioadmin
+    s3_region: us-east-1
+    s3_endpoint: localhost:19000
+    s3_url_style: path
+    s3_use_ssl: false
+YAML
+  fi
+  [[ "$LAKE_IS_S3" -eq 0 ]] && { rm -rf "$LAKE_DATA_PATH"; mkdir -p "$LAKE_DATA_PATH"; }
 else
   cargo build --release -p etl-replicator --features doris --no-default-features
   CONFIG_DIR="$TARGET_DIR/bench-doris-configuration"
@@ -271,11 +316,8 @@ wait_for_value() {
       actual="$("$DUCKDB" -noheader -list -c "
         install ducklake; load ducklake; install postgres; load postgres;
         install httpfs; load httpfs;
-        create or replace secret lake_storage (
-          type s3, key_id 'minioadmin', secret 'minioadmin',
-          endpoint 'localhost:19000', url_style 'path', use_ssl false
-        );
-        attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path 's3://lake/ducklake');
+        $LAKE_SECRET_SQL
+        attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path '$LAKE_DATA_PATH', override_data_path true);
         select 'N=' || cast(($query) as varchar);
       " 2>/dev/null | sed -n 's/^N=//p' | tail -1 || true)"
     else
@@ -340,11 +382,8 @@ if [[ "$DESTINATION" == "ducklake" ]]; then
     "$DUCKDB" -noheader -list -c "
       install ducklake; load ducklake; install postgres; load postgres;
       install httpfs; load httpfs;
-      create or replace secret lake_storage (
-        type s3, key_id 'minioadmin', secret 'minioadmin',
-        endpoint 'localhost:19000', url_style 'path', use_ssl false
-      );
-      attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path 's3://lake/ducklake');
+      $LAKE_SECRET_SQL
+      attach 'ducklake:postgres:${CATALOG_CONNINFO}' as lake (data_path '$LAKE_DATA_PATH', override_data_path true);
       $q;" > /dev/null 2>&1
     printf '%-70s %6s ms\n' "${q:0:70}" "$(( $(now_ms) - start ))"
   done

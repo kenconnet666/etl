@@ -549,9 +549,14 @@ pub(super) fn ssl_mode_to_str(ssl_mode: SslMode) -> EtlResult<&'static str> {
 }
 
 /// Returns a validated DuckLake data path string.
+///
+/// A local path is passed to DuckLake without its `file://` prefix, because
+/// DuckLake records the plain path in the catalog and rejects an attach whose
+/// `DATA_PATH` does not match it byte for byte.
 pub(super) fn validate_data_path(data_path: &Url) -> EtlResult<&str> {
     match data_path.scheme() {
-        "file" | "s3" | "gs" => Ok(data_path.as_str()),
+        "file" => Ok(data_path.path()),
+        "s3" | "gs" => Ok(data_path.as_str()),
         scheme => Err(etl_error!(
             ErrorKind::ConfigError,
             "Unsupported DuckLake data URL scheme",

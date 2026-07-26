@@ -4,7 +4,7 @@ use std::{env, error::Error, process::ExitCode};
 
 use etl_config::{
     default_ducklake_s3_url_style, default_ducklake_s3_use_ssl, load_config,
-    parse_ducklake_s3_data_path, parse_ducklake_url,
+    parse_ducklake_data_path, parse_ducklake_url,
     shared::{DestinationConfig, ReplicatorConfig},
 };
 use etl_maintenance::ducklake::{
@@ -81,7 +81,7 @@ async fn run(config: ReplicatorConfig) -> MaintenanceResult<()> {
 
     let maintenance_config = DuckLakeMaintenanceConfig {
         catalog_url: parse_ducklake_url(catalog_url.expose_secret())?,
-        data_path: parse_ducklake_s3_data_path(&data_path)?,
+        data_path: parse_ducklake_data_path(&data_path)?,
         s3,
         metadata_schema,
         maintenance_target_file_size,

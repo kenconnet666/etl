@@ -113,7 +113,7 @@ mod doris {
 mod ducklake {
     use etl::pipeline::Pipeline;
     use etl_config::{
-        default_ducklake_s3_url_style, default_ducklake_s3_use_ssl, parse_ducklake_s3_data_path,
+        default_ducklake_s3_url_style, default_ducklake_s3_use_ssl, parse_ducklake_data_path,
         parse_ducklake_url,
         shared::{
             DestinationConfig, DuckLakeMaintenanceMode as ConfigDuckLakeMaintenanceMode,
@@ -185,7 +185,7 @@ mod ducklake {
 
         let destination = DuckLakeDestination::new_with_external_maintenance(
             parse_ducklake_url(catalog_url.expose_secret()).map_err(ReplicatorError::config)?,
-            parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?,
+            parse_ducklake_data_path(data_path).map_err(ReplicatorError::config)?,
             *pool_size,
             s3_config,
             metadata_schema.clone(),
