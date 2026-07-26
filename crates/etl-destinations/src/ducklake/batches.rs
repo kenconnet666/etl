@@ -11,6 +11,7 @@ use std::collections::HashMap;
 #[cfg(feature = "test-utils")]
 use std::sync::LazyLock;
 use std::{
+    collections::HashSet,
     error, fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -68,16 +69,21 @@ use crate::{
 const SQL_INSERT_BATCH_SIZE: usize = 128;
 /// Maximum number of primary-key predicates per SQL `DELETE` batch.
 ///
-/// Keep this small so each delete statement remains cheap while still avoiding
-/// one round-trip per deleted row.
-const SQL_DELETE_BATCH_SIZE: usize = 16;
+/// A DuckLake delete costs roughly the same whether it removes one row or many,
+/// because it has to locate the Parquet files holding those rows and write a
+/// deletion file either way. Measured on the local stack, one single-predicate
+/// delete took about 109 ms, so the statement count dominates and predicates are
+/// batched generously.
+const SQL_DELETE_BATCH_SIZE: usize = 1024;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
-/// Keeping mixed insert/delete/update streams in the same batch improves
-/// insert throughput on interleaved workloads while still capping transaction
-/// lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 16;
+/// The apply loop already bounds a batch by bytes before it reaches the
+/// destination, so this only guards against an unbounded transaction. It used to
+/// be 16, which split 5000 streamed rows into 313 DuckLake transactions and made
+/// the per-transaction cost dominate: 433 commits at roughly 108 ms each. There
+/// is a single writer, so short transactions buy no conflict avoidance.
+const CDC_MUTATION_BATCH_SIZE: usize = 100_000;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Data inlining limit for append-only DuckLake helper tables.
@@ -1210,6 +1216,48 @@ fn push_prepared_mutation_batch(
     Ok(())
 }
 
+/// A replace-by-key group waiting to be flushed as one delete plus one insert.
+///
+/// A replace removes the row a key already holds and writes the new one, so a
+/// group can share a single delete and a single insert as long as no key repeats
+/// inside it. A repeat would make the outcome depend on the order rows land in,
+/// so it closes the group instead.
+#[derive(Default)]
+struct PendingReplaceGroup {
+    predicates: Vec<String>,
+    rows: Vec<TableRow>,
+    keys: HashSet<String>,
+}
+
+impl PendingReplaceGroup {
+    /// Returns whether adding `predicate` would repeat a key in this group.
+    fn conflicts_with(&self, predicate: &str) -> bool {
+        self.keys.contains(predicate)
+    }
+
+    /// Adds one replaced row to the group.
+    fn push(&mut self, predicate: String, row: TableRow) {
+        self.keys.insert(predicate.clone());
+        self.predicates.push(predicate);
+        self.rows.push(row);
+    }
+
+    /// Drains the group into a delete followed by an insert.
+    fn drain_into(&mut self, prepared_mutations: &mut Vec<PreparedTableMutation>) {
+        if self.predicates.is_empty() {
+            return;
+        }
+
+        prepared_mutations.push(PreparedTableMutation::Delete {
+            predicates: std::mem::take(&mut self.predicates),
+            origin: "replace",
+        });
+        prepared_mutations
+            .push(PreparedTableMutation::Upsert(prepare_rows(std::mem::take(&mut self.rows))));
+        self.keys.clear();
+    }
+}
+
 /// Groups ordered row mutations into retryable DuckDB operations.
 fn prepare_table_mutations(
     replicated_table_schema: &ReplicatedTableSchema,
@@ -1218,10 +1266,12 @@ fn prepare_table_mutations(
     let mut prepared_mutations = Vec::new();
     let mut upsert_rows = Vec::new();
     let mut delete_predicates = Vec::new();
+    let mut replaces = PendingReplaceGroup::default();
 
     for mutation in mutations {
         match mutation {
             TableMutation::Insert(row) => {
+                replaces.drain_into(&mut prepared_mutations);
                 if !delete_predicates.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Delete {
                         predicates: std::mem::take(&mut delete_predicates),
@@ -1231,6 +1281,7 @@ fn prepare_table_mutations(
                 upsert_rows.push(row);
             }
             TableMutation::Delete(row) => {
+                replaces.drain_into(&mut prepared_mutations);
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
@@ -1250,28 +1301,24 @@ fn prepare_table_mutations(
                         origin: "delete",
                     });
                 }
+                let predicate = delete_predicate_from_row(replicated_table_schema, &delete_row)?;
                 match new_row {
                     UpdatedTableRow::Full(upsert_row) => {
-                        prepared_mutations.push(PreparedTableMutation::Delete {
-                            predicates: vec![delete_predicate_from_row(
-                                replicated_table_schema,
-                                &delete_row,
-                            )?],
-                            origin: "update",
-                        });
-                        prepared_mutations
-                            .push(PreparedTableMutation::Upsert(prepare_rows(vec![upsert_row])));
+                        // The old image locates the row, so this is a replace
+                        // that happens to know its previous key.
+                        if replaces.conflicts_with(&predicate) {
+                            replaces.drain_into(&mut prepared_mutations);
+                        }
+                        replaces.push(predicate, upsert_row);
                     }
                     UpdatedTableRow::Partial(partial_row) => {
+                        replaces.drain_into(&mut prepared_mutations);
                         prepared_mutations.push(PreparedTableMutation::Update {
                             assignments: update_assignments_from_partial_row(
                                 replicated_table_schema,
                                 &partial_row,
                             )?,
-                            predicate: delete_predicate_from_row(
-                                replicated_table_schema,
-                                &delete_row,
-                            )?,
+                            predicate,
                         });
                     }
                 }
@@ -1289,15 +1336,16 @@ fn prepare_table_mutations(
                     });
                 }
 
-                prepared_mutations.push(PreparedTableMutation::Delete {
-                    predicates: vec![delete_predicate_from_row(replicated_table_schema, &row)?],
-                    origin: "replace",
-                });
-                prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(vec![row])));
+                let predicate = delete_predicate_from_row(replicated_table_schema, &row)?;
+                if replaces.conflicts_with(&predicate) {
+                    replaces.drain_into(&mut prepared_mutations);
+                }
+                replaces.push(predicate, row);
             }
         }
     }
 
+    replaces.drain_into(&mut prepared_mutations);
     if !upsert_rows.is_empty() {
         prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(upsert_rows)));
     }
