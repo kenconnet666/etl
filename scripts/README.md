@@ -22,4 +22,3 @@ intentionally unavailable, such as a slim Docker build stage.
 | `bin/` | Executable development scripts. |
 | `docker/` | Docker Compose file and resources mounted by the local stack. |
 | `docs/` | Documentation utility scripts. |
-| `k8s/local/` | Pre-defined Kubernetes resources for local OrbStack development. |

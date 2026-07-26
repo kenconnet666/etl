@@ -3,14 +3,13 @@
 ## Workspace Layout
 - Rust workspace crates live under `crates/`:
   - `crates/etl/`: core replication library.
-  - `crates/etl-api/`: HTTP API service.
   - `crates/etl-replicator/`: standalone replicator binary.
   - `crates/etl-postgres/`: Postgres integration.
   - `crates/etl-destinations/`: destination implementations.
   - `crates/etl-config/`: configuration types and loading.
+  - `crates/etl-maintenance/`: external maintenance coordination and runners.
   - `crates/etl-telemetry/`: tracing and Prometheus setup.
   - `crates/etl-examples/`: examples.
-  - `crates/etl-benchmarks/`: benchmarks.
   - `crates/xtask/`: workspace automation commands.
 - Docs live in `docs/`.
 - Local development and ops tooling live in `crates/xtask/` (run via `cargo x`) and `DEVELOPMENT.md`.
@@ -178,9 +177,6 @@
   copy an underlying error message into a description or detail when that is
   intentionally safer or clearer, such as replacing a sensitive internal error
   with a sanitized customer-facing explanation.
-- Do not leak Postgres, SQLx, or other database errors from `etl-api` HTTP
-  responses. Keep the original error in the internal chain and logs, but return
-  a generic customer-facing message for database failures.
 - Keep ETL Postgres and DuckDB errors useful for internal debugging by
   preserving the source chain and owned context, while still avoiding highly
   critical data.
@@ -286,7 +282,7 @@
 - When fixing a specific crate, run the narrowest relevant tests first, then broaden if needed.
 - When a test failure needs deeper debugging, rerun the targeted test with
   `ENABLE_TRACING=1`; set a focused `RUST_LOG` filter when needed, such as
-  `RUST_LOG=etl::replication::apply=debug,etl_destinations::bigquery=debug`,
+  `RUST_LOG=etl::replication::apply=debug,etl_destinations::ducklake=debug`,
   to make the relevant pipeline or destination logs visible.
 - Add or update tests when behavior changes, regressions are possible, or new logic is introduced.
 - Prefer existing test utilities and fixtures over custom test plumbing. Before adding bespoke

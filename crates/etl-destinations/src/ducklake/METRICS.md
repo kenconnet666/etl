@@ -8,7 +8,7 @@ The metrics fall into four groups:
 - write-path metrics: show how the ETL writer is batching, waiting, retrying,
   and flushing inline data.
 - external maintenance metrics: operation-trigger counts and duration samples
-  for time foreground ingestion was quiesced by the Kubernetes maintenance
+  for time foreground ingestion was quiesced by the external maintenance
   plane.
 - table-health samples: gauges recorded by a background sampler every 30 seconds
   from the PostgreSQL DuckLake metadata catalog. They describe the current shape
@@ -83,7 +83,7 @@ How to read them:
 - `etl_ducklake_external_maintenance_triggered_total`
 
 `etl_ducklake_external_maintenance_pause_duration_seconds` is emitted by the
-replicator when a Kubernetes-driven external maintenance pause ends. It measures
+replicator when an external maintenance pause ends. It measures
 only the time after the destination has drained foreground mutations and reported
 `Quiesced`; time spent queued by the controller is intentionally excluded.
 

@@ -1,469 +1,60 @@
-# `etl` — Examples
+# ETL Examples
 
-This crate contains practical examples demonstrating how to replicate data from Postgres to various destinations using the ETL pipeline.
+Runnable pipelines that replicate a Postgres source into one destination. They
+exist to exercise a destination end to end without wiring up the replicator
+binary and its configuration files.
 
-## Available Examples
+| Example | Binary | Feature | Destination |
+| --- | --- | --- | --- |
+| DuckLake | `ducklake` | `ducklake` | DuckLake over a Postgres catalog and local or S3 storage |
 
-| Example                         | Binary       | Feature      | Destination                                | Status      |
-| ------------------------------- | ------------ | ------------ | ------------------------------------------ | ----------- |
-| [BigQuery](#bigquery)           | `bigquery`   | `bigquery`   | Google BigQuery (cloud data warehouse)     | Stable      |
-| [ClickHouse](#clickhouse-setup) | `clickhouse` | `clickhouse` | ClickHouse (column-oriented OLAP database) | In progress |
-| [DuckLake](#ducklake)           | `ducklake`   | `ducklake`   | DuckLake (open data lake format)           | In progress |
-| [Snowflake](#snowflake)         | `snowflake`  | `snowflake`  | Snowflake (cloud data warehouse)           | In progress |
+## Running
 
-## Running an example
-
-The quickest way to run an example is via the xtask wrapper.
-
-After sourcing your `.env` (see `.env.example`), the DB connection is picked up automatically:
+The task runner fills in the source connection from the `TESTS_DATABASE_*`
+environment variables:
 
 ```bash
-source .env
-cargo x example snowflake
-cargo x example bigquery
-cargo x example clickhouse
-cargo x example ducklake
+cargo x seed                 # create example tables and data
+cargo x example ducklake     # run the pipeline
 ```
 
-This handles the `-p etl-examples --features <name>` boilerplate, injects `TESTS_DATABASE_*` env vars as `--db-*` flags, and defaults `--db-name` to `etl_testdata` and `--publication` to `seed_pub` (matching `cargo x seed`).
-
-Override any flag by passing it explicitly:
+Extra flags are passed through:
 
 ```bash
-cargo x example snowflake --db-name mydb --publication my_pub
+cargo x example ducklake --db-name mydb --publication my_pub
 ```
 
-### Building manually
-
-Each binary is feature-gated so you only compile the dependencies you need. Some
-destinations (e.g. `ducklake`) pull in heavy native dependencies that can take
-several minutes to compile.
+Without the task runner:
 
 ```bash
-# Build
-cargo build --bin bigquery -p etl-examples --features bigquery
-
-# Run
-cargo run --bin bigquery -p etl-examples --features bigquery -- [flags]
+cargo run --bin ducklake -p etl-examples --features ducklake -- [flags]
 ```
 
-Replace `bigquery` with `clickhouse`, `ducklake`, or `snowflake` as needed.
-
-### All examples
-
-```bash
-cargo build -p etl-examples --all-features
-```
-
----
-
-## Prerequisites (all examples)
-
-All examples require a Postgres database with **logical replication** enabled:
-
-```sql
--- postgresql.conf (or ALTER SYSTEM)
-wal_level = logical
-```
-
-The Postgres user must have the `REPLICATION` role:
-
-```sql
-ALTER USER my_user REPLICATION;
-```
-
-### Quick database setup
-
-The fastest way to get a seeded database with a publication is via the xtask:
-
-```bash
-# Start the dev Postgres primary (port 5430) and read replica (port 6430)
-cargo x init
-
-# Create and seed a database with 3 tables (users, orders, events) and a publication
-cargo x seed                          # defaults: etl_testdata, 1000 rows
-cargo x seed --rows 100000            # more data
-cargo x seed --database mydb --force  # custom name, recreate if exists
-```
-
-This creates three tables (users, orders, events) in the `public` schema and a
-`seed_pub` publication for them. Use `--help` for all options.
-
-### Manual setup
-
-If you prefer to use your own tables:
-
-```sql
--- Specific tables
-CREATE PUBLICATION my_pub FOR TABLE orders, customers;
-
--- All tables in the database
-CREATE PUBLICATION my_pub FOR ALL TABLES;
-```
-
----
+Every example accepts `--help`.
 
 ## DuckLake
 
-Replicates a Postgres publication into a **DuckLake** data lake.
-
-DuckLake separates storage into two components:
-
-| Component   | Role                                | Example                                              |
-| ----------- | ----------------------------------- | ---------------------------------------------------- |
-| **Catalog** | Metadata (tables, snapshots, stats) | PostgreSQL database                                  |
-| **Data**    | Row data as Parquet files           | Local directory or S3 / S3-compatible object storage |
-
-The destination loads the required DuckDB extensions before attaching the lake.
-Each batch of rows is committed as a single Parquet snapshot so the lake stays
-consistent and queryable at all times.
-
-### How it works
-
-1. The pipeline connects to Postgres and performs an initial bulk copy of every
-   table covered by the publication.
-2. It then streams real-time INSERT / UPDATE / DELETE changes using logical
-   replication.
-3. Every Postgres table becomes a DuckLake table. The name is derived from the
-   source schema and table name:
-
-   | Postgres           | DuckLake            |
-   | ------------------ | ------------------- |
-   | `public.orders`    | `public_orders`     |
-   | `my_schema.events` | `my__schema_events` |
-
-### Prerequisites
-
-1. A **PostgreSQL database** to act as the DuckLake catalog — create one if
-   you don't have one already:
-   ```sql
-   CREATE DATABASE ducklake_catalog;
-   ```
-2. A **data directory** (local) or an S3 / S3-compatible bucket where Parquet
-   files will be written.
-
-### Run
+DuckLake needs a Postgres catalog and a data path. The catalog must be a
+different database from the replication source.
 
 ```bash
 cargo run --bin ducklake -p etl-examples --features ducklake -- \
-    --db-host localhost \
-    --db-port 5432 \
-    --db-name mydb \
-    --db-username postgres \
-    --db-password mypassword \
-    --catalog-url postgres://user:pass@localhost:5432/ducklake_catalog \
-    --data-path s3://bucket/lake_data \
-    --publication my_pub \
-    --s3-access-key-id my-access-key \
-    --s3-secret-access-key my-secret-key
+  --db-host localhost --db-port 5430 --db-username postgres --db-password postgres \
+  --db-name etl_testdata --publication seed_pub \
+  --ducklake-catalog-url postgres://postgres:postgres@localhost:5430/ducklake_catalog \
+  --ducklake-data-path file:///tmp/ducklake-data
 ```
 
-## ClickHouse Setup
+For S3-compatible storage, pass an `s3://` data path together with the access
+key, secret key, region, endpoint, and URL style flags.
 
-To run the ClickHouse example, you'll need a running ClickHouse instance accessible over HTTP(S).
-ClickHouse **23.5 or newer** is required for the default `ReplacingMergeTree` engine.
-
-Create a publication in Postgres:
-
-```sql
-create publication my_pub
-for table table1, table2;
-```
-
-Then run the ClickHouse example:
-
-```bash
-cargo run -p etl-examples --bin clickhouse --features clickhouse -- \
-        --db-host localhost \
-        --db-port 5432 \
-        --db-name postgres \
-        --db-username postgres \
-        --db-password password \
-        --clickhouse-url http://localhost:8123 \
-        --clickhouse-user default \
-        --clickhouse-database default \
-        --publication my_pub
-```
-
-### Table engines
-
-The destination supports two layouts, chosen per pipeline via `--clickhouse-engine`:
-
-| Flag value                       | Engine               | Use it for                                              |
-| -------------------------------- | -------------------- | ------------------------------------------------------- |
-| `replacing_merge_tree` (default) | `ReplacingMergeTree` | Current-state replicas. Source must have a primary key. |
-| `merge_tree`                     | `MergeTree`          | Append-only event log. Works for PK-less source tables. |
-
-Table names are derived from the Postgres schema and table name using double-underscore
-escaping (e.g. `public.orders` -> `public_orders`, `my_schema.t` -> `my__schema_t`).
-
-#### ReplacingMergeTree (default)
-
-Each replicated table is created as `ReplacingMergeTree(_etl_version, _etl_deleted)` keyed
-on the source primary key. Two trailing columns drive dedup and tombstone handling:
-
-- `_etl_version UInt128` -- the packed Postgres event sequence key:
-  `(commit_lsn << 64) | tx_ordinal`. Higher values win during a `FINAL` merge, so the
-  latest event per primary key wins. Encoding both the commit LSN and the in-transaction
-  ordinal gives a total order across all events, including multiple row events that
-  share a WAL record.
-- `_etl_deleted UInt8` -- tombstone flag. `1` for DELETE events, `0` otherwise.
-
-Alongside each table, the destination also creates a `<table>__current` view that hides
-the ReplacingMergeTree internals:
-
-```sql
-CREATE VIEW IF NOT EXISTS "public_orders__current" AS
-SELECT <user columns>
-FROM "public_orders" FINAL
-WHERE _etl_deleted = 0
-```
-
-Read patterns:
-
-- Prefer the `__current` view for current-state queries.
-- Or query the base table with `SELECT ... FROM "public_orders" FINAL WHERE _etl_deleted = 0`
-  directly.
-
-`OPTIMIZE` guidance:
-
-- The replicator never runs `OPTIMIZE ... FINAL CLEANUP`. Background merges already
-  collapse duplicates over time; physical removal of tombstones is operator-driven.
-- To reclaim deleted rows on disk, run `OPTIMIZE TABLE "<table>" FINAL CLEANUP` on a
-  schedule that matches your retention requirements.
-
-#### MergeTree
-
-Each replicated table is created as `MergeTree() ORDER BY tuple()` with two CDC metadata
-columns appended to every row:
-
-- `cdc_operation`: `INSERT`, `UPDATE`, or `DELETE`
-- `cdc_lsn`: the Postgres commit LSN at the time of the change
-
-Read patterns:
-
-- Current state per primary key: take the latest event by `cdc_lsn` with `LIMIT 1 BY`,
-  then filter out tombstones. Example:
-
-  ```sql
-  SELECT <user columns> FROM (
-      SELECT * FROM "public_orders"
-      ORDER BY cdc_lsn DESC LIMIT 1 BY (id)
-  )
-  WHERE cdc_operation != 'DELETE'
-  ```
-
-- Event log queries: read the table directly; every CDC event is preserved.
-
-### Connection notes
-
-For HTTPS connections, provide an `https://` URL -- TLS is handled automatically using
-webpki root certificates. Use `--clickhouse-password` if your ClickHouse instance requires
-authentication.
-
-### Example configuration
-
-This is a fuller example that also enables a dedicated DuckDB log dump on
-shutdown:
-
-```bash
-cargo run --bin ducklake -p etl-examples --features ducklake -- \
-    --db-host postgres.etl-data-plane.svc.cluster.local \
-    --db-port 5432 \
-    --db-name mydb \
-    --db-username postgres \
-    --db-password password \
-    --catalog-url "postgres://postgres:password@postgres.etl-data-plane.svc.cluster.local:5432/mydb?sslmode=disable" \
-    --data-path s3://bucket/lake_data \
-    --publication my_pub \
-    --s3-access-key-id my-access-key \
-    --s3-secret-access-key my-secret-key \
-    --metadata-schema ducklake \
-    --pool-size 4 \
-    --max-batch-fill-duration-ms 5000 \
-    --max-table-sync-workers 4 \
-    --duckdb-log-storage-path /tmp/duckdb_logs \
-    --duckdb-log-dump-path /tmp/duckdb_logs_dump.csv
-```
-
-In this example:
-
-- `--catalog-url` points to the PostgreSQL database that stores DuckLake metadata.
-- `--data-path` points to the S3 / S3-compatible location for Parquet files.
-- `--metadata-schema ducklake` keeps DuckLake metadata tables in a dedicated Postgres schema.
-- `--duckdb-log-storage-path` enables `CALL enable_logging(storage_path = ...)` for each DuckDB connection.
-- `--duckdb-log-dump-path` writes a CSV dump of `SELECT * FROM duckdb_logs` during graceful shutdown.
-
-### Vendored DuckDB extensions
-
-For offline local development on Linux or macOS, you can prefetch the required
-DuckDB extensions into the repository and point the destination at them:
+DuckLake loads the `ducklake` and `postgres_scanner` DuckDB extensions. Vendor
+them once and point the destination at them:
 
 ```bash
 cargo x vendor-duckdb
-ETL_DUCKDB_EXTENSION_ROOT="$(pwd)/vendor/duckdb/extensions" \
-  cargo run --bin ducklake -p etl-examples --features ducklake -- [flags]
+export ETL_DUCKDB_EXTENSION_ROOT="$(pwd)/vendor/duckdb/extensions"
 ```
 
-If `ETL_DUCKDB_EXTENSION_ROOT` is unset, the destination also checks the
-repository-local `vendor/duckdb/extensions` directory automatically. Docker
-images do not need the env var because they already ship vendored extensions at
-`/app/duckdb_extensions`.
-
-### Run (S3 / S3-compatible data)
-
-```bash
-cargo run --bin ducklake -p etl-examples --features ducklake -- \
-    --db-host <pg-host> \
-    --db-port <pg-port> \
-    --db-name <pg-database> \
-    --db-username <pg-user> \
-    --db-password <pg-password> \
-    --catalog-url "postgres://<pg-user>:<pg-password>@<pg-host>:<pg-port>/<pg-database>?sslmode=disable" \
-    --data-path s3://<bucket-name>/ \
-    --publication <publication-name> \
-    --s3-access-key-id <access-key-id> \
-    --s3-secret-access-key <secret-access-key> \
-    --s3-region <region> \
-    --s3-endpoint <host>:<port>/<path> \
-    --metadata-schema <schema-name>
-```
-
-The example CLI requires S3 / S3-compatible cloud credentials. The destination
-loads DuckDB's `httpfs` extension during connection setup.
-
-### All flags
-
-| Flag                           | Default      | Description                                                       |
-| ------------------------------ | ------------ | ----------------------------------------------------------------- |
-| `--db-host`                    | _(required)_ | Postgres host                                                     |
-| `--db-port`                    | `5432`       | Postgres port                                                     |
-| `--db-name`                    | _(required)_ | Postgres database name                                            |
-| `--db-username`                | _(required)_ | Postgres user (must have REPLICATION)                             |
-| `--db-password`                | —            | Postgres password (omit for trust auth)                           |
-| `--catalog-url`                | _(required)_ | DuckLake catalog URL (`postgres://...` or `file://...`)           |
-| `--data-path`                  | _(required)_ | `s3://` URI for Parquet files                                     |
-| `--pool-size`                  | `4`          | DuckDB connection pool size                                       |
-| `--max-batch-fill-duration-ms` | `5000`       | Max time to wait before flushing a batch                          |
-| `--max-table-sync-workers`     | `4`          | Concurrent workers during initial copy                            |
-| `--publication`                | _(required)_ | Postgres publication name                                         |
-| `--s3-access-key-id`           | _(required)_ | S3 access key ID                                                  |
-| `--s3-secret-access-key`       | _(required)_ | S3 secret access key                                              |
-| `--s3-region`                  | `us-east-1`  | S3 region                                                         |
-| `--s3-endpoint`                | —            | Custom S3 endpoint, e.g. `127.0.0.1:5000/s3` for Supabase Storage |
-| `--s3-url-style`               | `path`       | URL style: `path` (MinIO/Supabase) or `vhost` (AWS)               |
-| `--s3-use-ssl`                 | `false`      | Enable TLS for the S3 connection                                  |
-| `--metadata-schema`            | —            | Postgres schema for DuckLake metadata tables (e.g. `ducklake`)    |
-| `--duckdb-log-storage-path`    | —            | Enables DuckDB file-backed logging for each DuckDB connection     |
-| `--duckdb-log-dump-path`       | —            | CSV file written from `duckdb_logs` during graceful shutdown      |
-
-### Query the replicated data
-
-Use the DuckDB CLI (install with `brew install duckdb` on macOS) to query the
-lake at any time — even while the pipeline is running:
-
-```bash
-duckdb :memory: -c "
-  INSTALL ducklake; LOAD ducklake;
-  ATTACH 'ducklake:postgres:host=''localhost'' port=''5432'' dbname=''ducklake_catalog'' user=''user'' password=''pass'''
-    AS lake (DATA_PATH 's3://bucket/lake_data');
-  SELECT * FROM lake.public_orders;
-  SELECT COUNT(*) FROM lake.public_customers;
-"
-```
-
-### Verbose logging
-
-```bash
-RUST_LOG=debug cargo run --bin ducklake -p etl-examples --features ducklake -- [flags]
-```
-
----
-
-## BigQuery
-
-Replicates a Postgres publication to a Google BigQuery dataset.
-
-### Prerequisites
-
-1. A Google Cloud project with the BigQuery API enabled.
-2. A service account with the **BigQuery Data Editor** and **BigQuery Job
-   User** roles.
-3. The service account key file downloaded from the GCP Console
-   (`IAM & Admin → Service Accounts → Keys → Add Key → JSON`).
-4. A BigQuery dataset created in your project.
-
-### Run
-
-```bash
-cargo run --bin bigquery -p etl-examples --features bigquery -- \
-    --db-host localhost \
-    --db-port 5432 \
-    --db-name postgres \
-    --db-username postgres \
-    --db-password password \
-    --bq-sa-key-file /path/to/service-account-key.json \
-    --bq-project-id your-gcp-project-id \
-    --bq-dataset-id your_bigquery_dataset_id \
-    --publication my_pub
-```
-
-### All flags
-
-| Flag                           | Default      | Description                              |
-| ------------------------------ | ------------ | ---------------------------------------- |
-| `--db-host`                    | _(required)_ | Postgres host                            |
-| `--db-port`                    | _(required)_ | Postgres port                            |
-| `--db-name`                    | _(required)_ | Postgres database name                   |
-| `--db-username`                | _(required)_ | Postgres user                            |
-| `--db-password`                | —            | Postgres password                        |
-| `--bq-sa-key-file`             | _(required)_ | Path to GCP service account key JSON     |
-| `--bq-project-id`              | _(required)_ | GCP project ID                           |
-| `--bq-dataset-id`              | _(required)_ | BigQuery dataset ID                      |
-| `--max-batch-fill-duration-ms` | `5000`       | Max time to wait before flushing a batch |
-| `--max-table-sync-workers`     | `4`          | Concurrent workers during initial copy   |
-| `--publication`                | _(required)_ | Postgres publication name                |
-
----
-
-## Snowflake
-
-Replicates a Postgres publication to a Snowflake database via Snowpipe Streaming.
-
-### Prerequisites
-
-1. A Snowflake account with a user configured for **key-pair authentication**.
-2. `TESTS_SNOWFLAKE_CONNECTION` set with the Snowflake JSON connection string.
-3. A target database and schema created in Snowflake.
-4. A role with USAGE on warehouse/database/schema and CREATE TABLE, CREATE STAGE,
-   CREATE PIPE on the schema.
-
-See `crates/etl-destinations/src/snowflake/README.md` for setup instructions and SQL commands.
-
-### Run
-
-```bash
-source .env
-cargo run --bin snowflake -p etl-examples --features snowflake -- \
-    --db-host localhost \
-    --db-port 5430 \
-    --db-name etl_testdata \
-    --db-username postgres \
-    --db-password postgres \
-    --publication seed_pub
-```
-
-The Snowflake example reads credentials from `TESTS_SNOWFLAKE_CONNECTION` only. The JSON object must contain `account`, `user`, `database`, `schema`, and `private_key`; `role` and `private_key_passphrase` are optional. Put `private_key` last so the target account details remain easy to inspect before the secret material.
-
-### All flags
-
-| Flag                           | Default      | Description                              |
-| ------------------------------ | ------------ | ---------------------------------------- |
-| `--db-host`                    | _(required)_ | Postgres host                            |
-| `--db-port`                    | _(required)_ | Postgres port                            |
-| `--db-name`                    | _(required)_ | Postgres database name                   |
-| `--db-username`                | _(required)_ | Postgres user                            |
-| `--db-password`                | --           | Postgres password                        |
-| `--max-batch-fill-duration-ms` | `5000`       | Max time to wait before flushing a batch |
-| `--max-table-sync-workers`     | `4`          | Concurrent workers during initial copy   |
-| `--publication`                | _(required)_ | Postgres publication name                |
+Without `ETL_DUCKDB_EXTENSION_ROOT`, DuckDB installs the extensions from its own
+repository at runtime, which requires network access.
