@@ -373,6 +373,35 @@ multi_rows=$((PER_TABLE * (TABLES - 1)))
 report "multi-table insert" "$multi_rows" "$source_ms" "$elapsed" \
   "$(throughput "$multi_rows" "$elapsed")"
 
+# --- 6. interleaved insert, update, and delete ------------------------------
+
+# Real change streams mix operations, and a destination that groups by operation
+# type has to close a group on every switch. A single-operation scenario cannot
+# show that, so this one interleaves all three inside one transaction.
+MIXED_ROWS=$((ROWS / 2))
+MIXED_BASE=$((ROWS * 4))
+start="$(now_ms)"
+source_sql "do \$\$
+  declare i bigint;
+begin
+  for i in 1..$MIXED_ROWS loop
+    insert into public.\"$TABLE_1\" values
+      ($MIXED_BASE + i, 'mixed_' || i, 1, 1.00,
+       jsonb_build_object('tier', 'silver'), now());
+    update public.\"$TABLE_1\" set quantity = 2 where id = $MIXED_BASE + i;
+    if i % 2 = 0 then
+      delete from public.\"$TABLE_1\" where id = $MIXED_BASE + i;
+    end if;
+  end loop;
+end \$\$"
+source_ms=$(( $(now_ms) - start ))
+
+# Half the inserted rows survive, since every second one is deleted again.
+mixed_expected=$((ROWS * 2 - DELETE_ROWS + MIXED_ROWS / 2))
+elapsed="$(wait_for_count "$TABLE_1" "$mixed_expected" 600 || true)"
+report "interleaved i/u/d" "$MIXED_ROWS" "$source_ms" "$elapsed" \
+  "$(throughput "$MIXED_ROWS" "$elapsed")"
+
 log "batch stage distribution"
 # The replicator exports Prometheus metrics on 9000; the stage histogram shows
 # where a batch spends its time instead of leaving it to guesswork.
