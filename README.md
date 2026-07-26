@@ -62,19 +62,19 @@ than subtracted, so each figure is end to end.
 
 | Scenario | Rows | Source write | To the replica | Rows/s |
 | --- | --- | --- | --- | --- |
-| Initial copy, catching up a backlog | 100,000 | 847 ms | 22,865 ms | 4,373 |
-| Streaming insert | 100,000 | 883 ms | 4,421 ms | 22,619 |
-| Streaming insert, 4 tables | 75,000 | 1,348 ms | 2,256 ms | 33,244 |
-| Interleaved insert/update/delete | 50,000 | 1,938 ms | 8,507 ms | 5,877 |
-| Warm update | 100,000 | 873 ms | 43,424 ms | 2,302 |
-| Warm delete | 50,000 | 154 ms | 22,542 ms | 2,218 |
+| Initial copy, catching up a backlog | 100,000 | 835 ms | 19,381 ms | 5,159 |
+| Streaming insert | 100,000 | 913 ms | 3,758 ms | 26,609 |
+| Streaming insert, 4 tables | 75,000 | 906 ms | 2,831 ms | 26,492 |
+| Interleaved insert/update/delete | 50,000 | 2,354 ms | 3,326 ms | 15,033 |
+| Warm update | 100,000 | 881 ms | 3,884 ms | 25,746 |
+| Warm delete | 50,000 | 227 ms | 2,035 ms | 24,570 |
 
-Comparing the same scenarios at 5,000 and 100,000 rows separates the fixed cost
-from the per-row cost: an insert costs about 0.031 ms per row, an update or
-delete about 0.42 ms, and the initial copy carries roughly 17 seconds of fixed
-cost that is not in the write path. So the insert path is close to saturating
-what the destination can absorb, while the delete path is bounded by how the
-delete predicate is expressed rather than by row volume.
+Streaming throughput sits in the same range across inserts, updates, and
+deletes, because a batch collapses by key into one delete matched through staged
+keys plus one insert, whatever mix of operations it contains. The initial copy is
+the outlier: its own table sync finishes in about 4.4 seconds, so most of the
+figure above is startup work outside the write path that has not been attributed
+yet.
 
 `scripts/bin/bench-replica.sh` reproduces these numbers, and
 [DEVELOPMENT.md](DEVELOPMENT.md) documents the measurement scope, the known gaps,

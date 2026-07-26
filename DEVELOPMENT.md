@@ -227,24 +227,25 @@ Measured on one machine with a local data path, comparing 5000 rows against
 | Path | Per row | Fixed |
 | --- | --- | --- |
 | Streaming insert | ~0.031 ms | ~1.3 s |
-| Warm update / delete | ~0.42 ms | ~1 s |
-| Initial copy | ~0.06 ms | ~17 s |
+| Warm update / delete | ~0.035 ms | ~1 s |
+| Initial copy | ~0.06 ms | ~18 s |
 
-The insert path is in the same range as the reference implementation this fork
-was measured against. Two gaps remain, both with a known cause:
+Streaming inserts, updates, and deletes are all in the same range now, because a
+batch collapses by key into one delete matched through staged keys plus one
+insert. That is close to what the destination can absorb, and matches the
+reference implementation this fork was measured against.
 
-**Deletes cost 13x more per row than inserts.** A batch already collapses into a
-single delete, so the cost is now the predicate list itself: a delete of 100000
-keys builds an expression with 100000 `OR` branches, which cannot use column
-statistics to prune. Writing the keys into a staging table and matching with
-`DELETE FROM t WHERE EXISTS (SELECT 1 FROM stg s WHERE t.k = s.k)` turns that
-into one hash join. This is the largest known win left.
-
-**The initial copy pays about 17 seconds of fixed cost** that is not in the write
-path: writing 5000 rows spends 0.33 s in the `upsert` stage. It is spread across
-pipeline startup, table creation, and table state transitions, none of which the
-current stage timings cover. Extending the timings to the table sync worker is
-the prerequisite for reducing it.
+**The initial copy is the one real gap.** Its own table sync takes about 4.4
+seconds — the state log goes `init` to `data_sync` to `sync_done` in that time —
+while the benchmark measures 19 seconds from replicator start to the destination
+matching. So roughly 14 seconds happen outside both the write path and the table
+sync worker. Ruled out so far: the number of tables (a single table measures the
+same), the batch fill window (a longer one changes nothing here), per-table write
+slot contention (20 batches wait 8.3 s in total but that overlaps with work), and
+serial connection pool warm-up (now parallel, with no effect on this figure).
+Worth checking next: process startup before the pipeline runs, source-side
+snapshot export and `COPY` throughput, and whether the benchmark's own polling
+still inflates it.
 
 Two smaller items: a DuckLake commit measures about 108 ms against roughly 23 ms
 for the reference implementation, cause not yet investigated; and
@@ -254,18 +255,16 @@ JSON as text, so `Utf8` would match.
 
 ### Next steps, in order
 
-1. **Replace the delete predicate list with a staging join.** Write the keys into
-   a staging table and match with
-   `DELETE FROM t WHERE EXISTS (SELECT 1 FROM stg s WHERE t.k = s.k)`. This is the
-   largest known win: it should pull the delete path's 0.42 ms per row toward the
-   insert path's 0.031 ms, which lands on the warm update, warm delete, and
-   interleaved scenarios at once. `SQL_DELETE_BATCH_SIZE` becomes irrelevant.
-2. **Extend the stage timings to the table sync worker**, then attack the initial
-   copy's 17 seconds of fixed cost. Do not guess at it first; the current
-   timings stop at the batch boundary, and every earlier guess about this code
-   turned out wrong.
-3. **Look at the commit stage** once the two above are done, and widen the Arrow
-   column coverage so a JSON or UUID column stops disabling it for a whole table.
+1. **Attribute the initial copy's fixed cost.** Time the replicator from process
+   start to the first copy batch, and time the source-side snapshot and `COPY`
+   separately from the destination write. Do not guess: every earlier guess about
+   this figure was wrong, including three in a row during the last round.
+2. **Look at the commit stage**, which is roughly 5x the reference
+   implementation's, and widen the Arrow column coverage so a JSON or UUID column
+   stops disabling it for a whole table.
+3. **Only then consider structural changes.** The insert and delete paths are
+   already near the destination's absorption rate, so further work there needs a
+   measurement showing which stage still dominates.
 
 ### Known open issues
 
@@ -278,7 +277,8 @@ JSON as text, so `Utf8` would match.
   still run against it and pass, because their volumes are small and the
   replicator retries.
 - The benchmark's `catchup` scenario reports a throughput figure that is mostly
-  fixed cost, so treat it as a latency measurement until item 2 above is done.
+  unattributed fixed cost, so treat it as a latency measurement until item 1
+  above is done.
 
 ## Migrations
 
