@@ -96,12 +96,14 @@ source_sql "create table public.\"$TABLE\" (
   id bigint primary key,
   customer text not null,
   quantity integer not null,
-  amount numeric(10, 2)
+  amount numeric(10, 2),
+  tags text[],
+  scores numeric(6, 2)[]
 )"
 source_sql "create publication $PUBLICATION for table public.\"$TABLE\""
 source_sql "insert into public.\"$TABLE\" values
-  (1, 'alice', 2, 19.99),
-  (2, 'bob', 1, 5.50)"
+  (1, 'alice', 2, 19.99, array['vip','eu'], array[1.50, 2.25]),
+  (2, 'bob', 1, 5.50, null, null)"
 
 log "resetting replication and destination state"
 source_sql "drop schema if exists etl cascade"
@@ -167,10 +169,30 @@ expect_doris "the replica reflects the current source state" \
    from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\`" \
   "1:alice:7,3:carol:4"
 
+expect_doris "arrays land in a native array column" \
+  "select array_size(tags) from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\` where id = 1" "2"
+expect_doris "an array element keeps its declared precision" \
+  "select array_sum(scores) from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\` where id = 1" "3.75"
+expect_doris "the array column type is native" \
+  "select lower(data_type) from information_schema.columns
+   where table_schema = '$DORIS_DATABASE' and table_name = '$DORIS_TABLE'
+     and column_name = 'tags'" "array"
+
+log "changing a primary key value"
+source_sql "update public.\"$TABLE\" set id = 30 where id = 3"
+
+# Postgres keeps the row identity in the old image, so the replica has to drop
+# the row it still holds under the previous key.
+expect_doris "the row moved to the new key without leaving a ghost" \
+  "select group_concat(cast(id as string) order by id)
+   from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\`" \
+  "1,30"
+
 log "following DDL: add a column and widen a type"
 source_sql "alter table public.\"$TABLE\" add column channel text"
 source_sql "alter table public.\"$TABLE\" alter column quantity type bigint"
-source_sql "insert into public.\"$TABLE\" values (4, 'dave', 5000000000, 12.00, 'web')"
+source_sql "insert into public.\"$TABLE\" values
+  (4, 'dave', 5000000000, 12.00, null, null, 'web')"
 
 expect_doris "the added column replicated" \
   "select channel from \`$DORIS_DATABASE\`.\`$DORIS_TABLE\` where id = 4" "web"

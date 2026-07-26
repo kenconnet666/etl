@@ -27,7 +27,7 @@ pub(super) fn cell_to_json(cell: &Cell) -> Value {
         Cell::Uuid(v) => Value::String(v.to_string()),
         Cell::Json(v) => v.clone(),
         Cell::Bytes(v) => Value::String(hex_encode(v)),
-        Cell::Array(v) => Value::String(array_to_text(v)),
+        Cell::Array(v) => array_to_json(v),
     }
 }
 
@@ -45,39 +45,41 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Converts a Postgres array cell to a text representation for varchar columns.
-fn array_to_text(array: &ArrayCell) -> String {
+/// Converts a Postgres array cell into a JSON array.
+///
+/// Doris takes a JSON array for an `array<...>` column, and every element is
+/// rendered the same way as the matching scalar type.
+fn array_to_json(array: &ArrayCell) -> Value {
     match array {
-        ArrayCell::Bool(v) => format_array(v),
-        ArrayCell::String(v) => format_array(v),
-        ArrayCell::I16(v) => format_array(v),
-        ArrayCell::I32(v) => format_array(v),
-        ArrayCell::U32(v) => format_array(v),
-        ArrayCell::I64(v) => format_array(v),
-        ArrayCell::F32(v) => format_array(v),
-        ArrayCell::F64(v) => format_array(v),
-        ArrayCell::Numeric(v) => format_array(v),
-        ArrayCell::Date(v) => format_array(v),
-        ArrayCell::Time(v) => format_array(v),
-        ArrayCell::TimeTz(v) => format_array(v),
-        ArrayCell::Timestamp(v) => format_array(v),
-        ArrayCell::TimestampTz(v) => format_array(v),
-        ArrayCell::Uuid(v) => format_array(v),
-        ArrayCell::Json(v) => format_array(v),
-        ArrayCell::Bytes(v) => format_array(v),
+        ArrayCell::Bool(v) => json_array(v, |e| Value::Bool(*e)),
+        ArrayCell::String(v) => json_array(v, |e| Value::String(e.clone())),
+        ArrayCell::I16(v) => json_array(v, |e| Value::Number(Number::from(*e))),
+        ArrayCell::I32(v) => json_array(v, |e| Value::Number(Number::from(*e))),
+        ArrayCell::U32(v) => json_array(v, |e| Value::Number(Number::from(*e))),
+        ArrayCell::I64(v) => json_array(v, |e| Value::Number(Number::from(*e))),
+        ArrayCell::F32(v) => json_array(v, |e| float_to_json(f64::from(*e))),
+        ArrayCell::F64(v) => json_array(v, |e| float_to_json(*e)),
+        ArrayCell::Numeric(v) => json_array(v, |e| Value::String(e.to_string())),
+        ArrayCell::Date(v) => json_array(v, |e| Value::String(e.to_string())),
+        ArrayCell::Time(v) => json_array(v, |e| Value::String(e.to_string())),
+        ArrayCell::TimeTz(v) => json_array(v, |e| Value::String(e.to_string())),
+        ArrayCell::Timestamp(v) => {
+            json_array(v, |e| Value::String(e.format(DATETIME_FORMAT).to_string()))
+        }
+        ArrayCell::TimestampTz(v) => {
+            json_array(v, |e| Value::String(e.naive_utc().format(DATETIME_FORMAT).to_string()))
+        }
+        ArrayCell::Uuid(v) => json_array(v, |e| Value::String(e.to_string())),
+        ArrayCell::Json(v) => json_array(v, Clone::clone),
+        ArrayCell::Bytes(v) => json_array(v, |e| Value::String(hex_encode(e))),
     }
 }
 
-/// Formats a nullable-element vector into `{elem1,elem2,...}` text.
-fn format_array<T: std::fmt::Debug>(elements: &[Option<T>]) -> String {
-    let inner: Vec<String> = elements
-        .iter()
-        .map(|e| match e {
-            Some(v) => format!("{v:?}"),
-            None => "NULL".to_owned(),
-        })
-        .collect();
-    format!("{{{}}}", inner.join(","))
+/// Renders a nullable-element vector as a JSON array.
+fn json_array<T>(elements: &[Option<T>], render: impl Fn(&T) -> Value) -> Value {
+    Value::Array(
+        elements.iter().map(|element| element.as_ref().map_or(Value::Null, &render)).collect(),
+    )
 }
 
 #[cfg(test)]
@@ -130,5 +132,17 @@ mod tests {
     fn bytes_encode_as_hex() {
         let v = cell_to_json(&Cell::Bytes(vec![0xde, 0xad]));
         assert_eq!(v, Value::String("dead".to_owned()));
+    }
+
+    #[test]
+    fn arrays_encode_as_json_arrays() {
+        let v = cell_to_json(&Cell::Array(ArrayCell::I32(vec![Some(1), None, Some(3)])));
+        assert_eq!(v, serde_json::json!([1, null, 3]));
+    }
+
+    #[test]
+    fn string_array_elements_are_not_debug_formatted() {
+        let v = cell_to_json(&Cell::Array(ArrayCell::String(vec![Some("a\"b".to_owned())])));
+        assert_eq!(v, serde_json::json!(["a\"b"]));
     }
 }

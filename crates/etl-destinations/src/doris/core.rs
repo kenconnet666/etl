@@ -16,7 +16,7 @@ use std::{
 };
 
 use etl::{
-    data::{OldTableRow, PartialTableRow, TableRow, UpdatedTableRow},
+    data::{Cell, OldTableRow, PartialTableRow, TableRow, UpdatedTableRow},
     destination::{
         Destination, DestinationTableMetadata, DestinationTableSchemaStatus,
         DestinationWriteStatus, DropTableForCopyResult, WriteEventsDurability, WriteEventsResult,
@@ -793,6 +793,19 @@ fn new_surrogate_key() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
+/// Renders one cell for a Doris column.
+///
+/// A key column cannot be an `array<...>`, so an array that is part of the key
+/// is stored as its JSON text to match the declared varchar column.
+fn render_cell(layout: &DorisTableLayout, column_name: &str, cell: &Cell) -> Value {
+    let value = cell_to_json(cell);
+    if value.is_array() && layout.key_columns.iter().any(|key| key == column_name) {
+        return Value::String(value.to_string());
+    }
+
+    value
+}
+
 /// Renders one source row as a Stream Load JSON object.
 fn row_to_json(
     replicated_table_schema: &ReplicatedTableSchema,
@@ -814,7 +827,7 @@ fn row_to_json(
         object.insert(SURROGATE_KEY_COLUMN.to_owned(), Value::String(surrogate_key.to_owned()));
     }
     for (column_schema, cell) in column_schemas.iter().zip(table_row.values()) {
-        object.insert(column_schema.name.clone(), cell_to_json(cell));
+        object.insert(column_schema.name.clone(), render_cell(layout, &column_schema.name, cell));
     }
     object.insert(DELETE_SIGN_COLUMN.to_owned(), json!(0));
 
@@ -840,7 +853,8 @@ fn delete_row_to_json(
     for (column_schema, cell) in column_schemas.iter().zip(table_row.values()) {
         if layout.key_columns.contains(&column_schema.name) {
             present_keys += 1;
-            object.insert(column_schema.name.clone(), cell_to_json(cell));
+            object
+                .insert(column_schema.name.clone(), render_cell(layout, &column_schema.name, cell));
         } else {
             object.insert(column_schema.name.clone(), Value::Null);
         }
@@ -887,7 +901,7 @@ fn partial_row_to_json(
                 partial_row.values().len(),
             ));
         };
-        object.insert(column_schema.name.clone(), cell_to_json(cell));
+        object.insert(column_schema.name.clone(), render_cell(layout, &column_schema.name, cell));
         columns.push(column_schema.name.clone());
     }
 

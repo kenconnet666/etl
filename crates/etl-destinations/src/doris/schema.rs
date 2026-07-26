@@ -2,7 +2,9 @@
 
 use std::borrow::Cow;
 
-use etl::schema::{ColumnSchema, NumericModifiers, ReplicatedTableSchema, Type, numeric_modifiers};
+use etl::schema::{
+    ColumnSchema, NumericModifiers, ReplicatedTableSchema, Type, is_array_type, numeric_modifiers,
+};
 
 use crate::doris::{DorisTableName, quote_identifier};
 
@@ -22,11 +24,26 @@ pub(super) const SURROGATE_KEY_COLUMN: &str = "_etl_row_id";
 const SURROGATE_KEY_TYPE: &str = "varchar(32)";
 
 /// Returns the Doris SQL type for a Postgres column.
+///
+/// A key column cannot be an `array<...>` in Doris, and it needs a bounded
+/// width, so an array that is part of the key falls back to a JSON text value.
 pub(super) fn postgres_type_to_doris_sql(
     typ: &Type,
     modifier: i32,
     is_key: bool,
 ) -> Cow<'static, str> {
+    if is_key {
+        return postgres_scalar_type_to_doris_sql(typ, modifier, true);
+    }
+    if is_array_type(typ) {
+        return postgres_array_type_to_doris_sql(typ, modifier);
+    }
+
+    postgres_scalar_type_to_doris_sql(typ, modifier, false)
+}
+
+/// Returns the Doris SQL type for a Postgres scalar type.
+fn postgres_scalar_type_to_doris_sql(typ: &Type, modifier: i32, is_key: bool) -> Cow<'static, str> {
     let fallback: Cow<'static, str> = if is_key {
         format!("varchar({KEY_VARCHAR_LENGTH})").into()
     } else {
@@ -38,20 +55,54 @@ pub(super) fn postgres_type_to_doris_sql(
         &Type::INT2 => "smallint".into(),
         &Type::INT4 => "int".into(),
         &Type::INT8 => "bigint".into(),
+        // A Postgres OID is unsigned and does not fit in a signed int.
+        &Type::OID => "bigint".into(),
         &Type::FLOAT4 => "float".into(),
         &Type::FLOAT8 => "double".into(),
-        &Type::NUMERIC => match numeric_modifiers(modifier) {
-            Some(NumericModifiers { p, s })
-                if (1..=DORIS_MAX_DECIMAL_PRECISION).contains(&p) && s >= 0 && s <= p =>
-            {
-                format!("decimal({p}, {s})").into()
-            }
-            _ => fallback,
-        },
+        &Type::NUMERIC => decimal_type(modifier).unwrap_or(fallback),
         &Type::DATE => "date".into(),
         &Type::TIMESTAMP | &Type::TIMESTAMPTZ => "datetime(6)".into(),
-        &Type::JSON | &Type::JSONB => "json".into(),
+        &Type::UUID => "varchar(36)".into(),
+        // Doris has no JSON key type, and a key needs a bounded width.
+        &Type::JSON | &Type::JSONB if !is_key => "json".into(),
         _ => fallback,
+    }
+}
+
+/// Returns the Doris SQL type for a Postgres array type.
+///
+/// An element type Doris cannot express becomes `string`, which keeps the array
+/// shape rather than collapsing the whole column to text.
+fn postgres_array_type_to_doris_sql(typ: &Type, modifier: i32) -> Cow<'static, str> {
+    let element: Cow<'static, str> = match typ {
+        &Type::BOOL_ARRAY => "boolean".into(),
+        &Type::INT2_ARRAY => "smallint".into(),
+        &Type::INT4_ARRAY => "int".into(),
+        &Type::INT8_ARRAY => "bigint".into(),
+        &Type::OID_ARRAY => "bigint".into(),
+        &Type::FLOAT4_ARRAY => "float".into(),
+        &Type::FLOAT8_ARRAY => "double".into(),
+        // An array shares the element's type modifier, so the precision of a
+        // `numeric(p, s)[]` column survives.
+        &Type::NUMERIC_ARRAY => decimal_type(modifier).unwrap_or_else(|| "string".into()),
+        &Type::DATE_ARRAY => "date".into(),
+        &Type::TIMESTAMP_ARRAY | &Type::TIMESTAMPTZ_ARRAY => "datetime(6)".into(),
+        _ => "string".into(),
+    };
+
+    format!("array<{element}>").into()
+}
+
+/// Returns the Doris `decimal` type for a Postgres numeric modifier, or
+/// [`None`] when the declared precision is outside what Doris can store.
+fn decimal_type(modifier: i32) -> Option<Cow<'static, str>> {
+    match numeric_modifiers(modifier) {
+        Some(NumericModifiers { p, s })
+            if (1..=DORIS_MAX_DECIMAL_PRECISION).contains(&p) && s >= 0 && s <= p =>
+        {
+            Some(format!("decimal({p}, {s})").into())
+        }
+        _ => None,
     }
 }
 
@@ -272,7 +323,41 @@ mod tests {
         assert_eq!(postgres_type_to_doris_sql(&Type::TIMESTAMPTZ, -1, false), "datetime(6)");
         assert_eq!(postgres_type_to_doris_sql(&Type::JSON, -1, false), "json");
         assert_eq!(postgres_type_to_doris_sql(&Type::JSONB, -1, false), "json");
-        assert_eq!(postgres_type_to_doris_sql(&Type::UUID, -1, false), "varchar(65533)");
+        assert_eq!(postgres_type_to_doris_sql(&Type::UUID, -1, false), "varchar(36)");
+        assert_eq!(postgres_type_to_doris_sql(&Type::OID, -1, false), "bigint");
+    }
+
+    #[test]
+    fn arrays_map_to_native_arrays() {
+        assert_eq!(postgres_type_to_doris_sql(&Type::INT4_ARRAY, -1, false), "array<int>");
+        assert_eq!(postgres_type_to_doris_sql(&Type::TEXT_ARRAY, -1, false), "array<string>");
+        assert_eq!(
+            postgres_type_to_doris_sql(&Type::TIMESTAMPTZ_ARRAY, -1, false),
+            "array<datetime(6)>"
+        );
+    }
+
+    #[test]
+    fn a_numeric_array_keeps_the_element_precision() {
+        let modifier = (10 << 16) | (2 + 4);
+        assert_eq!(
+            postgres_type_to_doris_sql(&Type::NUMERIC_ARRAY, modifier, false),
+            "array<decimal(10, 2)>"
+        );
+    }
+
+    #[test]
+    fn a_key_column_never_becomes_an_array() {
+        // Doris rejects an array in `UNIQUE KEY`, and a key needs a bounded
+        // width, so the value is stored as text instead.
+        assert_eq!(
+            postgres_type_to_doris_sql(&Type::INT4_ARRAY, -1, true),
+            format!("varchar({KEY_VARCHAR_LENGTH})")
+        );
+        assert_eq!(
+            postgres_type_to_doris_sql(&Type::JSONB, -1, true),
+            format!("varchar({KEY_VARCHAR_LENGTH})")
+        );
     }
 
     #[test]
