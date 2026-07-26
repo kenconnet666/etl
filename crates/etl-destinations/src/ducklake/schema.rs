@@ -302,36 +302,31 @@ pub(super) fn build_table_rename_sql_ducklake(
     ]
 }
 
-/// Builds a DuckLake `alter table alter column set data type` statement.
+/// Builds the statements that change a DuckLake column type.
 ///
-/// DuckDB applies its own implicit cast while rewriting the column, so a
-/// widening source change such as `integer` to `bigint` succeeds directly. A
-/// change the destination cannot cast fails loudly instead of silently writing
-/// mismatched values.
-pub(super) fn build_alter_column_type_sql_ducklake(
+/// DuckLake rejects an in-place `alter column ... set data type`, so the column
+/// is rewritten through a temporary column. Only add, update, drop, and rename
+/// are used, which DuckLake supports, and the whole sequence runs inside the
+/// caller's DDL transaction so a failure leaves the table untouched.
+pub(super) fn build_column_retype_sql_ducklake(
     table_name: &DuckLakeTableName,
-    column_name: &str,
-    typ: &Type,
-    modifier: i32,
-) -> String {
-    let ducklake_type = postgres_column_type_to_ducklake_sql(typ, modifier);
-    let table_name = qualified_lake_table_name(table_name);
-    let column_name = quote_identifier(column_name);
+    column_schema: &ColumnSchema,
+    retype_column_name: &str,
+) -> Vec<String> {
+    let qualified_name = qualified_lake_table_name(table_name);
+    let column_name = quote_identifier(&column_schema.name);
+    let retype_name = quote_identifier(retype_column_name);
+    let ducklake_type =
+        postgres_column_type_to_ducklake_sql(&column_schema.typ, column_schema.modifier);
 
-    format!("alter table {table_name} alter column {column_name} set data type {ducklake_type}")
-}
-
-/// Builds a DuckLake `alter table alter column set/drop not null` statement.
-pub(super) fn build_alter_column_nullability_sql_ducklake(
-    table_name: &DuckLakeTableName,
-    column_name: &str,
-    nullable: bool,
-) -> String {
-    let table_name = qualified_lake_table_name(table_name);
-    let column_name = quote_identifier(column_name);
-    let action = if nullable { "drop not null" } else { "set not null" };
-
-    format!("alter table {table_name} alter column {column_name} {action}")
+    vec![
+        format!("alter table {qualified_name} add column {retype_name} {ducklake_type}"),
+        format!(
+            "update {qualified_name} set {retype_name} = cast({column_name} as {ducklake_type})"
+        ),
+        format!("alter table {qualified_name} drop column {column_name}"),
+        format!("alter table {qualified_name} rename column {retype_name} to {column_name}"),
+    ]
 }
 
 /// Builds a DuckLake `alter table alter column set default` statement.

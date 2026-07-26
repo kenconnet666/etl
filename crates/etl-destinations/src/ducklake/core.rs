@@ -73,12 +73,11 @@ use crate::ducklake::{
         ensure_replay_epoch_table_exists, read_table_replay_epoch, rename_table_replay_epoch,
     },
     schema::{
-        build_add_column_sql_ducklake, build_alter_column_nullability_sql_ducklake,
-        build_alter_column_type_sql_ducklake, build_create_table_sql_ducklake,
-        build_drop_column_sql_ducklake, build_drop_default_sql_ducklake,
-        build_rename_column_sql_ducklake, build_set_default_sql_ducklake,
-        build_table_rename_sql_ducklake, postgres_column_type_to_ducklake_sql,
-        supports_column_default_ducklake,
+        build_add_column_sql_ducklake, build_column_retype_sql_ducklake,
+        build_create_table_sql_ducklake, build_drop_column_sql_ducklake,
+        build_drop_default_sql_ducklake, build_rename_column_sql_ducklake,
+        build_set_default_sql_ducklake, build_table_rename_sql_ducklake,
+        postgres_column_type_to_ducklake_sql, supports_column_default_ducklake,
     },
     sql::qualified_lake_table_name,
 };
@@ -92,6 +91,9 @@ const DUCKLAKE_METADATA_PG_POOL_SIZE: u32 = 1;
 /// Prefix for ETL-owned tombstone columns that keep same-name replacement DDL
 /// replay-safe.
 pub(super) const DUCKLAKE_DROPPED_COLUMN_PREFIX: &str = "__etl_ducklake_dropped_";
+
+/// Prefix for the temporary column used to rewrite a column type.
+const DUCKLAKE_RETYPE_COLUMN_PREFIX: &str = "__etl_ducklake_retype_";
 
 /// Builds the shared Postgres metadata pool used by background samplers.
 fn build_ducklake_metadata_pg_pool(catalog_url: &Url) -> EtlResult<PgPool> {
@@ -739,25 +741,33 @@ fn plan_schema_diff_sql_ducklake(
                         continue;
                     }
 
-                    statements.push(DuckLakeSchemaDdlStatement {
-                        sql: build_alter_column_type_sql_ducklake(
-                            table_name,
-                            &change.new_column.name,
-                            new_type,
-                            *new_modifier,
-                        ),
-                        error_description: "DuckLake alter table alter column type failed",
-                    });
+                    // DuckLake does not support changing a column type in
+                    // place, so the column is rewritten through a temporary
+                    // column that only uses add, update, drop, and rename.
+                    let retype_name =
+                        format!("{DUCKLAKE_RETYPE_COLUMN_PREFIX}{}", change.new_column.name);
+                    for sql in build_column_retype_sql_ducklake(
+                        table_name,
+                        &change.new_column,
+                        &retype_name,
+                    ) {
+                        statements.push(DuckLakeSchemaDdlStatement {
+                            sql,
+                            error_description: "DuckLake column type rewrite failed",
+                        });
+                    }
                 }
-                ColumnModification::Nullability { new_nullable, .. } => {
-                    statements.push(DuckLakeSchemaDdlStatement {
-                        sql: build_alter_column_nullability_sql_ducklake(
-                            table_name,
-                            &change.new_column.name,
-                            *new_nullable,
-                        ),
-                        error_description: "DuckLake alter table alter column nullability failed",
-                    });
+                ColumnModification::Nullability { old_nullable, new_nullable } => {
+                    // The replica mirrors source data, not source constraints,
+                    // and only ETL writes these tables, so the destination
+                    // keeps the nullability it was created with.
+                    debug!(
+                        table = %table_name,
+                        column = %change.new_column.name,
+                        old_nullable,
+                        new_nullable,
+                        "ducklake keeps the destination column nullability unchanged"
+                    );
                 }
                 ColumnModification::Default { old_expression, new_expression } => {
                     let old_default_was_supported =

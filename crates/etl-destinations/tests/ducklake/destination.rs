@@ -2441,13 +2441,13 @@ async fn write_events_with_partial_updates() {
     assert_eq!(name, "ripe");
 }
 
-/// Missing replica identity should fail mutations clearly instead of silently
-/// skipping them.
+/// Missing replica identity should degrade to an append-only log instead of
+/// failing the table.
 #[tokio::test(flavor = "multi_thread")]
-async fn write_events_without_replica_identity_rejects_mutations() {
+async fn write_events_without_replica_identity_appends_instead_of_failing() {
     use etl::event::UpdateEvent;
 
-    let lake = create_test_lake("write_events_without_replica_identity_rejects_mutations").await;
+    let lake = create_test_lake("write_events_without_replica_identity_appends").await;
     let catalog_url = lake.catalog_url.clone();
     let data_url = lake.data_url.clone();
 
@@ -2484,7 +2484,7 @@ async fn write_events_without_replica_identity_rejects_mutations() {
         .unwrap();
 
     let update_lsn = PgLsn::from(450u64);
-    let update_error = destination
+    destination
         .write_events(vec![Event::Update(UpdateEvent {
             start_lsn: update_lsn,
             commit_lsn: update_lsn,
@@ -2497,12 +2497,10 @@ async fn write_events_without_replica_identity_rejects_mutations() {
             old_table_row: None,
         })])
         .await
-        .unwrap_err();
-    assert_eq!(update_error.kind(), ErrorKind::SourceReplicaIdentityError);
-    assert_eq!(update_error.description(), Some("DuckLake update requires a replica identity"));
+        .unwrap();
 
     let delete_lsn = PgLsn::from(451u64);
-    let delete_error = destination
+    destination
         .write_events(vec![Event::Delete(DeleteEvent {
             start_lsn: delete_lsn,
             commit_lsn: delete_lsn,
@@ -2511,20 +2509,24 @@ async fn write_events_without_replica_identity_rejects_mutations() {
             old_table_row: None,
         })])
         .await
-        .unwrap_err();
-    assert_eq!(delete_error.kind(), ErrorKind::SourceReplicaIdentityError);
-    assert_eq!(delete_error.description(), Some("DuckLake delete requires a replica identity"));
+        .unwrap();
 
     let conn = open_lake_conn_when_tables_visible(&catalog_url, &data_url, &[&table_name]).await;
-    assert_eq!(count_rows(&conn, &table_name), 1);
-    let name: String = conn
-        .query_row(
-            &format!("SELECT name FROM {} WHERE id = 1", qualified_lake_table_name(&table_name)),
-            [],
-            |r| r.get(0),
-        )
+    // The update appended a second version of the row and the delete was
+    // skipped, because the source never sends a key image for this table.
+    assert_eq!(count_rows(&conn, &table_name), 2);
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT name FROM {} ORDER BY name",
+            qualified_lake_table_name(&table_name)
+        ))
         .unwrap();
-    assert_eq!(name, "seed");
+    let names: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|name| name.unwrap())
+        .collect();
+    assert_eq!(names, vec!["grown".to_owned(), "seed".to_owned()]);
 }
 
 /// Replaying the same CDC batch should be a no-op after the progress row is

@@ -1,4 +1,4 @@
-FROM postgres:17-bookworm
+FROM postgres:18-bookworm
 
 USER root
 

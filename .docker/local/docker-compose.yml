@@ -21,7 +21,7 @@ services:
   # Source PostgreSQL — logical replication enabled, CDC role + publication created by initdb
   source-pg:
     build: ./postgres
-    image: etl-local-pg17
+    image: etl-local-pg18
     restart: unless-stopped
     logging: *logging
     shm_size: 128mb
@@ -38,7 +38,7 @@ services:
     ports:
       - "15432:5432"
     volumes:
-      - source-pg-data:/var/lib/postgresql/data
+      - source-pg-data:/var/lib/postgresql
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -47,7 +47,7 @@ services:
 
   # Catalog PostgreSQL — dedicated instance for DuckLake metadata
   catalog-pg:
-    image: etl-local-pg17
+    image: etl-local-pg18
     restart: unless-stopped
     logging: *logging
     depends_on:
@@ -60,7 +60,7 @@ services:
     ports:
       - "15434:5432"
     volumes:
-      - catalog-pg-data:/var/lib/postgresql/data
+      - catalog-pg-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lake_admin -d ducklake_catalog"]
       interval: 5s

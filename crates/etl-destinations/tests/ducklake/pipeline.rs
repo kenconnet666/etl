@@ -1665,7 +1665,7 @@ fn query_ducklake_column_type(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn schema_change_column_type_and_nullability() {
+async fn schema_change_column_type() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -1711,8 +1711,9 @@ async fn schema_change_column_type_and_nullability() {
         .wait_for_events_count(vec![(EventType::Relation, 1), (EventType::Insert, 1)])
         .await;
 
-    // Widen `qty` past the 32-bit range and tighten `note` to not null. Both
-    // changes must reach DuckLake so the replica keeps matching the source.
+    // Widen `qty` past the 32-bit range and tighten `note` to not null. The
+    // type change must reach DuckLake so the replica keeps matching the source,
+    // while the constraint change is intentionally not mirrored.
     database
         .alter_table(
             table_name.clone(),
@@ -1739,8 +1740,6 @@ async fn schema_change_column_type_and_nullability() {
     let conn = open_lake_conn(&catalog_url, &data_url);
     let (qty_type, _) = query_ducklake_column_type(&conn, &ducklake_table_name, "qty");
     assert_eq!(qty_type, "BIGINT");
-    let (_, note_nullable) = query_ducklake_column_type(&conn, &ducklake_table_name, "note");
-    assert_eq!(note_nullable, "NO");
     assert_eq!(
         query_schema_type_rows(&conn, &ducklake_table_name),
         vec![
