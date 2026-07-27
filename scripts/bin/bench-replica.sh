@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Measures replication throughput against the local stack.
 #
-# Reported throughput is `rows * 1000 / elapsed_ms`, floored. Each scenario names
-# exactly what the clock covers, because the numbers are not comparable
-# otherwise:
+# Two rates are reported. `rows/s` divides by the destination drain alone, and
+# `rows/s_e2e` divides by the source write plus the drain. The second one is the
+# sustained rate, because the replicator is already consuming while the source is
+# still writing, so the drain clock covers only the tail of the work while being
+# charged for every row. The gap between the two ran from a tenth to a third when
+# measured. Each scenario names exactly what the clock covers, because the numbers
+# are not comparable otherwise:
 #
 # - catchup:   the replicator is stopped, rows are written to the source to build
 #              a backlog, then the clock runs from replicator start until the
 #              destination count matches. Includes reconnect and a cold table.
+#              There is no overlap to correct for, so no `rows/s_e2e` is printed.
 # - streaming: the replicator is already running; the clock covers the source
 #              write and the wait for the destination to match.
 # - warm:      like streaming, but the table already holds the rows being
 #              updated or deleted.
-#
-# Source write time is reported separately and is not subtracted, so a streaming
-# number is an end-to-end figure rather than a destination-only one.
 #
 # The lake writes through the local stack's S3 endpoint, so object-storage
 # round trips are included. Point LAKE_DATA_PATH elsewhere to change that.
@@ -23,9 +25,56 @@ set -euo pipefail
 DESTINATION="${DESTINATION:-ducklake}"
 ROWS="${ROWS:-100000}"
 TABLES="${TABLES:-4}"
-SOURCE_DSN="${SOURCE_DSN:-postgres://postgres:changeme@localhost:15432/postgres}"
-CATALOG_DSN="${CATALOG_DSN:-postgres://lake_admin:changeme@localhost:15434/ducklake_catalog}"
-CATALOG_CONNINFO="${CATALOG_CONNINFO:-host=localhost port=15434 dbname=ducklake_catalog user=lake_admin password=changeme}"
+# Where the replicator reaches the source and the catalog.
+#
+# The defaults use the published ports, which is convenient but caps throughput:
+# Docker's userland proxy copies every packet through a process, and a drain that
+# reaches 163,159 rows/s over a unix socket measures 53,350 through it. Point
+# these at the containers' bridge addresses, or run the replicator on the same
+# network, before quoting any throughput figure.
+PG_HOST="${PG_HOST:-localhost}"
+PG_PORT="${PG_PORT:-15432}"
+PG_USER="${PG_USER:-postgres}"
+PG_PASSWORD="${PG_PASSWORD:-changeme}"
+PG_DATABASE="${PG_DATABASE:-postgres}"
+CATALOG_HOST="${CATALOG_HOST:-localhost}"
+CATALOG_PORT="${CATALOG_PORT:-15434}"
+CATALOG_USER="${CATALOG_USER:-lake_admin}"
+CATALOG_PASSWORD="${CATALOG_PASSWORD:-changeme}"
+CATALOG_DATABASE="${CATALOG_DATABASE:-ducklake_catalog}"
+SOURCE_DSN="${SOURCE_DSN:-postgres://$PG_USER:$PG_PASSWORD@$PG_HOST:$PG_PORT/$PG_DATABASE}"
+CATALOG_DSN="${CATALOG_DSN:-postgres://$CATALOG_USER:$CATALOG_PASSWORD@$CATALOG_HOST:$CATALOG_PORT/$CATALOG_DATABASE}"
+CATALOG_CONNINFO="${CATALOG_CONNINFO:-host=$CATALOG_HOST port=$CATALOG_PORT dbname=$CATALOG_DATABASE user=$CATALOG_USER password=$CATALOG_PASSWORD}"
+# Batch shape. The defaults match the library defaults; override them to see how
+# much of a result is batch granularity rather than per-row cost.
+BATCH_MAX_BYTES="${BATCH_MAX_BYTES:-8388608}"
+BATCH_MAX_FILL_MS="${BATCH_MAX_FILL_MS:-500}"
+# Row shape. `wide` is six columns including jsonb and timestamptz, which is what
+# a real table tends to look like. `narrow` is three cheap columns, useful for
+# separating per-cell decoding cost from everything else and for comparing against
+# benchmarks built on a narrow row.
+ROW_SHAPE="${ROW_SHAPE:-wide}"
+case "$ROW_SHAPE" in
+  wide)
+    TABLE_DDL='id bigint primary key,
+    customer text not null,
+    quantity integer not null,
+    amount numeric(10, 2),
+    payload jsonb,
+    created_at timestamptz not null default now()'
+    MUTABLE_COLUMN="quantity"
+    ;;
+  narrow)
+    TABLE_DDL='id bigint primary key,
+    name text,
+    val numeric(12, 2)'
+    MUTABLE_COLUMN="val"
+    ;;
+  *)
+    echo "ROW_SHAPE must be wide or narrow, got: $ROW_SHAPE" >&2
+    exit 1
+    ;;
+esac
 DUCKDB="${DUCKDB:-duckdb}"
 LAKE_DATA_PATH="${LAKE_DATA_PATH:-s3://lake/ducklake}"
 # S3 settings only apply to an s3:// data path.
@@ -115,13 +164,30 @@ wait_for_count() {
 
 # Prints one result row of the report.
 report() {
-  printf '%-22s %10s %12s %12s %12s\n' "$1" "$2" "$3" "$4" "$5"
+  printf '%-22s %10s %12s %12s %12s %12s\n' "$1" "$2" "$3" "$4" "$5" "$6"
 }
 
+# Rate over the destination drain alone.
 throughput() {
   local rows="$1" elapsed_ms="$2"
   if [[ "$elapsed_ms" =~ ^[0-9]+$ ]] && [[ "$elapsed_ms" -gt 0 ]]; then
     echo $((rows * 1000 / elapsed_ms))
+  else
+    echo "-"
+  fi
+}
+
+# Sustained rate over the source write and the drain together.
+#
+# The replicator is already consuming while the source is still writing, so the
+# drain clock covers only the tail of the work while being charged for every row.
+# That reads a tenth to a third high, which is why this is the figure the README
+# quotes. The catchup scenario passes `-` because the replicator is stopped for
+# the whole source write, leaving no overlap to correct for.
+throughput_e2e() {
+  local rows="$1" source_ms="$2" elapsed_ms="$3"
+  if [[ "$elapsed_ms" =~ ^[0-9]+$ ]] && [[ $((source_ms + elapsed_ms)) -gt 0 ]]; then
+    echo $((rows * 1000 / (source_ms + elapsed_ms)))
   else
     echo "-"
   fi
@@ -156,14 +222,7 @@ log "resetting the source"
 source_sql "drop publication if exists $PUBLICATION"
 for i in $(seq 1 "$TABLES"); do
   source_sql "drop table if exists public.\"${TABLE_PREFIX}_$i\""
-  source_sql "create table public.\"${TABLE_PREFIX}_$i\" (
-    id bigint primary key,
-    customer text not null,
-    quantity integer not null,
-    amount numeric(10, 2),
-    payload jsonb,
-    created_at timestamptz not null default now()
-  )"
+  source_sql "create table public.\"${TABLE_PREFIX}_$i\" ($TABLE_DDL)"
 done
 TABLE_LIST=""
 for i in $(seq 1 "$TABLES"); do
@@ -175,7 +234,7 @@ source_sql "create publication $PUBLICATION for table $TABLE_LIST"
 log "resetting replication and destination state"
 source_sql "drop schema if exists etl cascade"
 if [[ "$DESTINATION" == "ducklake" ]]; then
-  psql "${CATALOG_DSN:-postgres://lake_admin:changeme@localhost:15434/ducklake_catalog}" \
+  psql "$CATALOG_DSN" \
     -v ON_ERROR_STOP=1 -q -c "
     do \$\$
     declare t text;
@@ -205,19 +264,22 @@ YAML
 pipeline:
   id: $PIPELINE_ID
   publication_name: $PUBLICATION
+  batch:
+    max_bytes: $BATCH_MAX_BYTES
+    max_fill_ms: $BATCH_MAX_FILL_MS
   pg_connection:
-    host: localhost
-    port: 15432
-    name: postgres
-    username: postgres
-    password: changeme
+    host: $PG_HOST
+    port: $PG_PORT
+    name: $PG_DATABASE
+    username: $PG_USER
+    password: $PG_PASSWORD
     tls:
       enabled: false
       trusted_root_certs: ""
 
 destination:
   ducklake:
-    catalog_url: postgres://lake_admin:changeme@localhost:15434/ducklake_catalog
+    catalog_url: postgres://$CATALOG_USER:$CATALOG_PASSWORD@$CATALOG_HOST:$CATALOG_PORT/$CATALOG_DATABASE
     data_path: $LAKE_DATA_PATH
     maintenance_mode: postgres
 YAML
@@ -245,12 +307,15 @@ YAML
 pipeline:
   id: $PIPELINE_ID
   publication_name: $PUBLICATION
+  batch:
+    max_bytes: $BATCH_MAX_BYTES
+    max_fill_ms: $BATCH_MAX_FILL_MS
   pg_connection:
-    host: localhost
-    port: 15432
-    name: postgres
-    username: postgres
-    password: changeme
+    host: $PG_HOST
+    port: $PG_PORT
+    name: $PG_DATABASE
+    username: $PG_USER
+    password: $PG_PASSWORD
     tls:
       enabled: false
       trusted_root_certs: ""
@@ -271,6 +336,12 @@ fi
 # Generates `count` rows into one table starting at `offset`.
 fill() {
   local table="$1" offset="$2" count="$3"
+  if [[ "$ROW_SHAPE" == "narrow" ]]; then
+    source_sql "insert into public.\"$table\"
+      select $offset + i, 'row-' || ($offset + i), (($offset + i) % 10000) * 0.01
+      from generate_series(1, $count) g(i)"
+    return
+  fi
   source_sql "insert into public.\"$table\"
     select $offset + i,
            'customer_' || (i % 997),
@@ -290,7 +361,7 @@ fi
 echo
 echo "destination=$DESTINATION rows=$ROWS tables=$TABLES"
 echo
-report "scenario" "rows" "source_ms" "replica_ms" "rows/s"
+report "scenario" "rows" "source_ms" "replica_ms" "rows/s" "rows/s_e2e"
 
 # --- 1. catchup: backlog first, then start the replicator -------------------
 
@@ -301,7 +372,7 @@ source_ms=$(( $(now_ms) - start ))
 
 start_replicator
 elapsed="$(wait_for_count "$TABLE_1" "$ROWS" 600 || true)"
-report "catchup" "$ROWS" "$source_ms" "$elapsed" "$(throughput "$ROWS" "$elapsed")"
+report "catchup" "$ROWS" "$source_ms" "$elapsed" "$(throughput "$ROWS" "$elapsed")" "-"
 
 # --- 2. streaming insert ----------------------------------------------------
 
@@ -309,7 +380,9 @@ start="$(now_ms)"
 fill "$TABLE_1" "$ROWS" "$ROWS"
 source_ms=$(( $(now_ms) - start ))
 elapsed="$(wait_for_count "$TABLE_1" $((ROWS * 2)) 600 || true)"
-report "streaming insert" "$ROWS" "$source_ms" "$elapsed" "$(throughput "$ROWS" "$elapsed")"
+report "streaming insert" "$ROWS" "$source_ms" "$elapsed" \
+  "$(throughput "$ROWS" "$elapsed")" \
+  "$(throughput_e2e "$ROWS" "$source_ms" "$elapsed")"
 
 # --- 3. warm update ---------------------------------------------------------
 
@@ -343,15 +416,17 @@ wait_for_value() {
 }
 
 start="$(now_ms)"
-source_sql "update public.\"$TABLE_1\" set quantity = 777 where id <= $ROWS"
+source_sql "update public.\"$TABLE_1\" set $MUTABLE_COLUMN = 777 where id <= $ROWS"
 source_ms=$(( $(now_ms) - start ))
 if [[ "$DESTINATION" == "ducklake" ]]; then
-  query="select count(*) from lake.public.\"$TABLE_1\" where quantity = 777"
+  query="select count(*) from lake.public.\"$TABLE_1\" where $MUTABLE_COLUMN = 777"
 else
-  query="count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` where quantity = 777"
+  query="count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` where $MUTABLE_COLUMN = 777"
 fi
 elapsed="$(wait_for_value "$TABLE_1" "$query" "$ROWS" 600 || true)"
-report "warm update" "$ROWS" "$source_ms" "$elapsed" "$(throughput "$ROWS" "$elapsed")"
+report "warm update" "$ROWS" "$source_ms" "$elapsed" \
+  "$(throughput "$ROWS" "$elapsed")" \
+  "$(throughput_e2e "$ROWS" "$source_ms" "$elapsed")"
 
 # --- 4. warm delete ---------------------------------------------------------
 
@@ -360,7 +435,9 @@ start="$(now_ms)"
 source_sql "delete from public.\"$TABLE_1\" where id <= $DELETE_ROWS"
 source_ms=$(( $(now_ms) - start ))
 elapsed="$(wait_for_count "$TABLE_1" $((ROWS * 2 - DELETE_ROWS)) 600 || true)"
-report "warm delete" "$DELETE_ROWS" "$source_ms" "$elapsed" "$(throughput "$DELETE_ROWS" "$elapsed")"
+report "warm delete" "$DELETE_ROWS" "$source_ms" "$elapsed" \
+  "$(throughput "$DELETE_ROWS" "$elapsed")" \
+  "$(throughput_e2e "$DELETE_ROWS" "$source_ms" "$elapsed")"
 
 # --- 5. multi-table insert --------------------------------------------------
 
@@ -379,7 +456,8 @@ elapsed=$(( $(now_ms) - multi_start ))
 [[ "$multi_failed" -eq 1 ]] && elapsed="timeout"
 multi_rows=$((PER_TABLE * (TABLES - 1)))
 report "multi-table insert" "$multi_rows" "$source_ms" "$elapsed" \
-  "$(throughput "$multi_rows" "$elapsed")"
+  "$(throughput "$multi_rows" "$elapsed")" \
+  "$(throughput_e2e "$multi_rows" "$source_ms" "$elapsed")"
 
 # --- 6. interleaved insert, update, and delete ------------------------------
 
@@ -388,15 +466,19 @@ report "multi-table insert" "$multi_rows" "$source_ms" "$elapsed" \
 # show that, so this one interleaves all three inside one transaction.
 MIXED_ROWS=$((ROWS / 2))
 MIXED_BASE=$((ROWS * 4))
+if [[ "$ROW_SHAPE" == "narrow" ]]; then
+  MIXED_VALUES="($MIXED_BASE + i, 'mixed_' || i, 1.00)"
+else
+  MIXED_VALUES="($MIXED_BASE + i, 'mixed_' || i, 1, 1.00,
+       jsonb_build_object('tier', 'silver'), now())"
+fi
 start="$(now_ms)"
 source_sql "do \$\$
   declare i bigint;
 begin
   for i in 1..$MIXED_ROWS loop
-    insert into public.\"$TABLE_1\" values
-      ($MIXED_BASE + i, 'mixed_' || i, 1, 1.00,
-       jsonb_build_object('tier', 'silver'), now());
-    update public.\"$TABLE_1\" set quantity = 2 where id = $MIXED_BASE + i;
+    insert into public.\"$TABLE_1\" values $MIXED_VALUES;
+    update public.\"$TABLE_1\" set $MUTABLE_COLUMN = 2 where id = $MIXED_BASE + i;
     if i % 2 = 0 then
       delete from public.\"$TABLE_1\" where id = $MIXED_BASE + i;
     end if;
@@ -408,7 +490,8 @@ source_ms=$(( $(now_ms) - start ))
 mixed_expected=$((ROWS * 2 - DELETE_ROWS + MIXED_ROWS / 2))
 elapsed="$(wait_for_count "$TABLE_1" "$mixed_expected" 600 || true)"
 report "interleaved i/u/d" "$MIXED_ROWS" "$source_ms" "$elapsed" \
-  "$(throughput "$MIXED_ROWS" "$elapsed")"
+  "$(throughput "$MIXED_ROWS" "$elapsed")" \
+  "$(throughput_e2e "$MIXED_ROWS" "$source_ms" "$elapsed")"
 
 log "batch stage distribution"
 # The replicator exports Prometheus metrics on 9000; the stage histogram shows
@@ -424,10 +507,29 @@ else
 fi
 
 log "analytical queries on the replica"
+if [[ "$ROW_SHAPE" == "narrow" ]]; then
+  DUCKLAKE_QUERIES=(
+    "select count(*) from lake.public.\"$TABLE_1\""
+    "select name, sum(val) s from lake.public.\"$TABLE_1\" group by name order by s desc limit 5"
+  )
+  DORIS_QUERIES=(
+    "select count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\`"
+    "select name, sum(val) s from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` group by name order by s desc limit 5"
+  )
+else
+  DUCKLAKE_QUERIES=(
+    "select count(*) from lake.public.\"$TABLE_1\""
+    "select customer, sum(amount) s from lake.public.\"$TABLE_1\" group by customer order by s desc limit 5"
+    "select count(*) from lake.public.\"$TABLE_1\" where cast(payload['tier'] as varchar) = 'gold'"
+  )
+  DORIS_QUERIES=(
+    "select count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\`"
+    "select customer, sum(amount) s from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` group by customer order by s desc limit 5"
+    "select count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` where cast(payload['tier'] as string) = 'gold'"
+  )
+fi
 if [[ "$DESTINATION" == "ducklake" ]]; then
-  for q in "select count(*) from lake.public.\"$TABLE_1\"" \
-           "select customer, sum(amount) s from lake.public.\"$TABLE_1\" group by customer order by s desc limit 5" \
-           "select count(*) from lake.public.\"$TABLE_1\" where cast(payload['tier'] as varchar) = 'gold'"; do
+  for q in "${DUCKLAKE_QUERIES[@]}"; do
     start="$(now_ms)"
     "$DUCKDB" -noheader -list -c "
       install ducklake; load ducklake; install postgres; load postgres;
@@ -440,9 +542,7 @@ if [[ "$DESTINATION" == "ducklake" ]]; then
 else
   args=(-h "$DORIS_HOST" -P "$DORIS_MYSQL_PORT" -u "$DORIS_USER" -N -B)
   [[ -n "$DORIS_PASSWORD" ]] && args+=("-p$DORIS_PASSWORD")
-  for q in "select count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\`" \
-           "select customer, sum(amount) s from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` group by customer order by s desc limit 5" \
-           "select count(*) from \`$DORIS_DATABASE\`.\`public_$TABLE_1\` where cast(payload['tier'] as string) = 'gold'"; do
+  for q in "${DORIS_QUERIES[@]}"; do
     start="$(now_ms)"
     mysql "${args[@]}" -e "$q" > /dev/null 2>&1
     printf '%-70s %6s ms\n' "${q:0:70}" "$(( $(now_ms) - start ))"

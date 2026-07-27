@@ -72,47 +72,109 @@ then differ in shape, and `etl-resync` is the way back to a matching one.
 
 ## Performance
 
-Measured on one developer machine (WSL2 Debian, Postgres 18 source, Postgres 18
-DuckLake catalog, local data path so object-storage latency stays out of the
-numbers). Throughput is `rows * 1000 / elapsed_ms`; these are single observations
-rather than percentiles, and the source write time is reported alongside rather
-than subtracted, so each figure is end to end.
+Measured on one developer machine: WSL2 Debian 13, 12 vCPU, 30 GB, Docker 26.1.5.
+The source is Postgres 18.4 with `wal_level = logical`, the DuckLake catalog is a
+second Postgres 18.4 instance, and the lake data path is a local directory so
+object-storage latency stays out of the numbers.
 
-| Scenario | Rows | Source write | DuckLake rows/s | Doris rows/s |
+**Both Postgres instances run on the host network.** That is the standard
+configuration for these figures, because a published Docker port becomes the
+throughput limit. Draining the same 1,000,000-change backlog with
+`pg_recvlogical`, no row decoding on our side and no destination:
+
+| Path from consumer to source | rows/s |
+| --- | --- |
+| None: `pg_logical_slot_peek_binary_changes` in a SQL backend | 258,732 |
+| Unix domain socket | 154,966 |
+| Host network, TCP to `127.0.0.1` | 142,877 |
+| TCP over the Docker bridge | 69,842 |
+| TCP through a published port and Docker's userland proxy | 57,763 |
+
+Decoding costs 3.9 µs per change. Host networking and a unix socket land within
+8% of each other, so TCP itself is not expensive — the extra hops are. A published
+port more than halves the rate, because `docker-proxy` copies every packet through
+a userland process. Colocating the replicator with its source is the largest
+transport lever and it needs no code.
+
+Throughput below is `rows / (source write + destination drain)`; both parts count,
+because the replicator is already consuming while the source is still writing, and
+charging every row to the drain alone reads a fifth to a third high. The initial
+copy is the exception, since the replicator is stopped for the whole source write.
+Two observations per scenario, not percentiles.
+
+| Scenario | Rows | Source write | Drain | DuckLake rows/s |
 | --- | --- | --- | --- | --- |
-| Initial copy, catching up a backlog | 1,000,000 | ~8,000 ms | 29,670 | 120,163 |
-| Streaming insert | 1,000,000 | ~8,500 ms | 37,601 | 36,756 |
-| Streaming insert, 4 tables | 750,000 | ~6,000 ms | 46,097 | 46,842 |
-| Warm update | 1,000,000 | ~9,500 ms | 30,447 | 32,466 |
-| Warm delete | 500,000 | ~1,700 ms | 48,477 | 54,656 |
-| Interleaved insert/update/delete | 500,000 | ~22,500 ms | 17,442 | 18,660 |
+| Warm delete | 500,000 | 0.9 s | 4.6 s | 91,558 / 89,526 |
+| Initial copy, catching up a backlog | 1,000,000 | 3.4 s | 14.5 s | 68,799 / 64,103 |
+| Streaming insert, 4 tables | 750,000 | 3.1 s | 8.9 s | 62,568 / 60,803 |
+| Streaming insert | 1,000,000 | 3.9 s | 15.7 s | 51,164 / 53,262 |
+| Warm update | 1,000,000 | 4.6 s | 18.8 s | 42,731 / 42,364 |
+| Interleaved insert/update/delete | 500,000 | 7.8 s | 14.8 s | 22,142 / 21,440 |
+
+**The bottleneck is this code, not the source and not the destination.** A streaming
+insert runs at 37% of the 142,877 rows/s the source hands over on the same path.
+Per change that is 18.8 µs against the source's 7.0. The destination accounts for
+4.1 µs of it: a full six-scenario run wrote 4.5 M streamed rows through DuckLake in
+18.6 s of summed stage time, which is roughly 244,000 rows/s of capacity. That
+leaves about 7.7 µs per change in decoding, event construction, and batching
+between the socket and the destination write.
+
+Two things move that figure a long way, and neither needs code. Both measured at
+1,000,000 rows:
+
+| Configuration | Streaming insert |
+| --- | --- |
+| Defaults, six-column row with `jsonb` and `timestamptz` | 51,198 |
+| `batch.max_bytes` raised to 64 MiB | 65,163 |
+| 64 MiB and a three-column row of `bigint`, `text`, `numeric` | 117,274 |
+
+The 8 MiB default caps a batch at a median 16,772 rows, which is 223 DuckLake
+transactions across a six-scenario run against 68 at 64 MiB. Raising
+`batch.max_fill_ms` past its 500 ms default does not help further. Row shape is the
+larger factor: every cell arrives as Postgres text and is parsed into a typed value
+before it is staged, so `jsonb`, `timestamptz`, and `numeric` columns are
+substantially more expensive per row than integers and text. At 5,000,000 rows on
+the narrow shape the streaming insert reaches 124,672 and the initial copy 375,742,
+so these figures scale rather than degrade.
+[DEVELOPMENT.md](DEVELOPMENT.md) has the stage breakdown and a comparison against
+another implementation on the same machine.
 
 Streaming throughput sits in the same range across inserts, updates, and deletes,
-and across the two destinations, because a batch collapses by key before it is
-written: DuckLake applies one delete matched through staged keys plus one insert,
-and Doris issues one Stream Load, whatever mix of operations the batch contains.
-The interleaved figure is lower mostly on the source side, where generating it row
-by row in a PL/pgSQL loop takes 22 s of the 27 s.
+because a batch collapses by key before it is written: DuckLake applies one delete
+matched through staged keys plus one insert, whatever mix of operations the batch
+contains. The median batch carries 16,772 rows. The interleaved figure is the
+outlier on both sides — the source spends 35% of the measurement generating the
+rows one at a time in a PL/pgSQL loop, and the surviving half of the rows costs a
+delete pass as well as an insert.
 
-The initial copy is where the two destinations separate. Doris absorbs a copy
-batch as a single Stream Load, while DuckLake pays a fixed cost of roughly 18 s
-per run to materialise Parquet files and commit catalog snapshots, which at this
-row count is most of the difference.
+Scale matters when reading these. At 100,000 rows a streaming insert measures
+37,258 rows/s instead of 53,262, because a fixed cost of roughly 0.9 s per scenario
+— the batch fill window, connection setup, and the benchmark's own polling
+granularity — dominates there. The initial copy is the extreme case: about 8.8 s of
+replicator start, DuckDB extension load, and catalog bootstrap, so 100,000 rows
+measure 10,527 rows/s against 68,799 at 1,000,000. Compare figures at the same row
+count and over the same transport.
 
-Scale matters when reading these. At 100,000 rows the same scenarios measure
-roughly 25,000 rows/s, because a fixed cost of about 1.5 s per scenario — the
-batch fill window, connection setup, and the benchmark's own polling granularity
-— is 40% of the total there and 4% here. Compare figures at the same row count.
+Two protocol options are off in this code today and both were measured to help,
+though only through a published port, so the sizes need redoing: `binary 'true'`
+took a drain from 53,513 to 59,719 rows/s, and for one large mixed transaction of
+1,250,000 changes `streaming 'on'` took 50,709 to 66,988 changes/s while removing a
+216 MB reorder-buffer spill.
 
-Streaming inserts are within 3% of what the source can deliver: draining the same
-rows from an equivalent slot with `pg_recvlogical` into `/dev/null`, with no row
-decoding and no destination, reaches 38,630 rows/s against the 37,601 above. Going
-materially faster requires several replication slots decoding in parallel rather
-than changes to this code.
+Sharding across replication slots scales sublinearly: 1,000,000 rows over four
+tables drained at 58,779 rows/s through one slot, 100,010 through two, and 130,856
+through four, because every walsender still reads all of the WAL. Those were also
+measured through a published port.
 
-`scripts/bin/bench-replica.sh` reproduces these numbers, and
-[DEVELOPMENT.md](DEVELOPMENT.md) documents the measurement scope, the known gaps,
-and the local environment traps that distort results.
+The Doris destination was not re-measured in this round, because the official
+Doris 4.1.3 frontend image crash-loops on this WSL2 kernel; see
+[DEVELOPMENT.md](DEVELOPMENT.md).
+
+`scripts/bin/bench-replica.sh` reproduces these numbers; set `PG_HOST`,
+`PG_PORT`, `CATALOG_HOST`, and `CATALOG_PORT` at host-network instances, because
+the defaults use the published ports. [DEVELOPMENT.md](DEVELOPMENT.md) documents
+the measurement scope, the known gaps, and the local environment traps that
+distort results.
 
 ## Recovering from divergence
 
